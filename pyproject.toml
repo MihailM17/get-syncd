@@ -9,6 +9,7 @@ authors = [{ name = "Get Syncd Contributors" }]
 dependencies = [
     "opentimelineio>=0.17",
     "rich>=13",
+    "Pillow>=10",
 ]
 
 [project.optional-dependencies]

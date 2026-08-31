@@ -146,6 +146,16 @@ def save_version(
     except Exception:
         pass
 
+    # Generate preview image for GUI (best-effort, Pillow optional)
+    try:
+        from .preview import generate_preview  # type: ignore
+        try:
+            generate_preview(repo, commit_hash, dest)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     return commit_hash
 
 

@@ -186,6 +186,12 @@ def cmd_save(args):
             shutil.copy2(str(repo / dest), str(history_dir / f"{commit_hash[:8]}.otio"))
         except Exception:
             pass
+        # preview for GUI
+        try:
+            from .preview import generate_preview
+            generate_preview(repo, commit_hash, repo / dest)
+        except Exception:
+            pass
         ui.print_save_success(commit_hash[:8], message, repo, is_first=is_first)
         return
 

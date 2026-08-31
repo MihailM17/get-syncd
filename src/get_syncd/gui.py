@@ -1,18 +1,13 @@
-"""Get Syncd — Sidecar desktop app (runs alongside DaVinci Resolve).
+"""Get Syncd — Sidecar desktop app (v2 friendly).
 
-One window, no terminal needed. Button "Export from Resolve" triggers the
-Resolve API (if available) to write timeline.otio into your project folder,
-then shows diff, lets you add a note, save, view history, diff any two saves,
-and one-click "Change to this version" (restore --apply) so next Resolve import
-shows that version.
+One place for everything: all timelines live in ~/GetSyncd/timeline.otio
+No hunting for files — the app *is* the place.
+- Big friendly buttons: Export, Save, Refresh
+- Live preview image per version (timeline bar)
+- Git tree visualiser + branch switcher
+- Auto-detect + manual Refresh (fixes "export didn't appear")
 
-Fallback: if Resolve API export isn't available in your version, shows manual
-File → Export Timeline → OpenTimelineIO instructions and watches the folder
-(`get-syncd watch` style).
-
-Works with Resolve Free or Studio on macOS/Win/Linux. Tested on M2 Mac.
-Tkinter is built-in Python — no extra pip deps. If Tk not available, prints help
-and falls back to TUI.
+Tkinter (built-in). Pillow optional for nicer previews (fallback to canvas).
 """
 
 from __future__ import annotations
@@ -23,8 +18,8 @@ import subprocess
 import threading
 import time
 import tempfile
+import hashlib
 from pathlib import Path
-from typing import Optional
 
 try:
     import tkinter as tk
@@ -36,64 +31,85 @@ except Exception:
 from . import git_store
 from .otio_parse import parse_otio_file
 from .diff import diff_timelines, changelog_line
+from .preview import generate_preview, _preview_path, ensure_previews, HAS_PIL
 
+# PIL ImageTk needed for display (separate from preview generation)
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL_TK = HAS_PIL
+except Exception:
+    HAS_PIL_TK = False
+    Image = ImageTk = None
 
+DEFAULT_WORKSPACE = Path.home() / "GetSyncd"
+PREVIEW_DIRNAME = ".get-syncd/previews"
+
+# ---------- Resolve export ----------
 def _try_resolve_export(out_path: Path) -> tuple[bool, str]:
-    """Try to export current Resolve timeline to out_path via API. Returns (ok, msg)."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Strategy 1: try DaVinciResolveScript module (external scripting)
     resolve = None
     try:
-        # Resolve's module path on macOS
         for p in [
             "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
-            os.path.expanduser("~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
+            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
         ]:
             if p not in sys.path and Path(p).exists():
                 sys.path.append(p)
         import DaVinciResolveScript as bmd  # type: ignore
         resolve = bmd.scriptapp("Resolve")
     except Exception as e:
-        # try bmd global (inside Resolve console)
         try:
-            resolve = globals().get("bmd") or __import__("builtins").__dict__.get("bmd")  # type: ignore
+            resolve = globals().get("bmd")
         except Exception:
             pass
         if resolve is None:
-            return False, f"Resolve API not reachable ({e}). Is Resolve running? Enable Preferences → System → General → External scripting: Local."
+            return False, f"Resolve API not reachable ({e}). Is Resolve running? Set Preferences → System → General → External scripting: Local."
 
     if resolve is None:
-        return False, "Could not connect to DaVinci Resolve. Open Resolve and a project first."
-
+        return False, "Could not connect to Resolve. Open Resolve and a project first."
     try:
         pm = resolve.GetProjectManager()
         project = pm.GetCurrentProject() if pm else None
         if not project:
-            return False, "No project open in Resolve. Open a project and timeline first."
+            return False, "No project open in Resolve."
         timeline = project.GetCurrentTimeline()
         if not timeline:
-            return False, "No timeline open. Open a timeline in the Edit page."
+            return False, "No timeline open in Edit page."
         name = timeline.GetName() if hasattr(timeline, "GetName") else "timeline"
-        # Try several export method names (vary by Resolve version)
         for meth in ["Export", "ExportTimeline", "ExportOTIO"]:
             if hasattr(timeline, meth):
                 try:
                     ok = getattr(timeline, meth)(str(out_path), "otio")
                     if ok:
-                        return True, f"Exported '{name}' via Timeline.{meth} → {out_path}"
-                except Exception as ee:
+                        return True, f"Exported '{name}' → {out_path}"
+                except Exception:
                     continue
         if hasattr(project, "ExportTimeline"):
             try:
                 ok = project.ExportTimeline(str(out_path), "otio")
                 if ok:
-                    return True, f"Exported '{name}' via Project.ExportTimeline → {out_path}"
-            except Exception as ee:
+                    return True, f"Exported '{name}' → {out_path}"
+            except Exception:
                 pass
-        return False, "Automatic export not available in this Resolve version. Use File → Export Timeline → OpenTimelineIO → timeline.otio (manual fallback works fine)."
+        return False, "Auto export not available in this Resolve version. Use File → Export Timeline → OpenTimelineIO → timeline.otio (manual fallback works)."
     except Exception as e:
         return False, f"Export error: {e}"
 
+# ---------- git tree ----------
+def get_git_graph(repo: Path) -> str:
+    try:
+        # pretty graph with branches
+        r = subprocess.run(
+            ["git", "log", "--graph", "--all", "--oneline", "--decorate", "-n", "30", "--color=never"],
+            cwd=str(repo), capture_output=True, text=True
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+        # fallback to simple log
+        r2 = subprocess.run(["git", "log", "--oneline", "-n", "20"], cwd=str(repo), capture_output=True, text=True)
+        return r2.stdout.strip() or "(no history yet)"
+    except Exception as e:
+        return f"(git tree unavailable: {e})"
 
 def _get_branches(repo: Path) -> list[str]:
     try:
@@ -110,123 +126,188 @@ def _create_branch(repo: Path, name: str):
 def _switch_branch(repo: Path, name: str):
     subprocess.run(["git", "checkout", name], cwd=str(repo), check=True)
 
-
+# ---------- App ----------
 class SidecarApp:
     def __init__(self, repo: Path):
+        # Enforce single-place workspace: default to ~/GetSyncd if caller passed app repo
+        if repo.resolve() == Path(__file__).resolve().parents[2]:
+            repo = DEFAULT_WORKSPACE
+        if str(repo).endswith("get-syncd") and repo.name == "get-syncd":
+            # user launched from app folder — redirect to workspace
+            repo = DEFAULT_WORKSPACE
         self.repo = repo
+        self.repo.mkdir(parents=True, exist_ok=True)
+        # auto-init if needed
+        if not git_store.is_git_repo(self.repo):
+            git_store.init_repo(self.repo)
+
         self.root = tk.Tk()
-        self.root.title(f"Get Syncd — {repo.name} — Sidecar")
-        self.root.geometry("980x680")
+        self.root.title(f"Get Syncd — Sidecar  •  {self.repo.name}")
+        self.root.geometry("1100x740")
+        self.root.minsize(980, 640)
         try:
-            self.root.tk.call("tk", "scaling", 2.0)
+            self.root.tk.call("tk", "scaling", 1.8)
         except Exception:
             pass
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        self._watching = False
+        self._preview_images = {}  # keep refs
         self._build_ui()
         self._refresh_all()
-        # watch thread
-        self._watch_thread = None
-        self._watching = False
+        # ensure previews in background
+        threading.Thread(target=lambda: ensure_previews(self.repo), daemon=True).start()
+        # start watch by default (friendly)
+        self.root.after(800, lambda: self._toggle_watch())
 
     def _build_ui(self):
-        # top bar: repo path + browse + status
-        top = ttk.Frame(self.root, padding=8)
-        top.pack(fill=tk.X)
-        ttk.Label(top, text="Project folder:").pack(side=tk.LEFT)
-        self.repo_var = tk.StringVar(value=str(self.repo))
-        ttk.Entry(top, textvariable=self.repo_var, width=46).pack(side=tk.LEFT, padx=6)
-        ttk.Button(top, text="Browse…", command=self._browse).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Init", command=self._init).pack(side=tk.LEFT, padx=4)
-        self.status_lbl = ttk.Label(top, text="—", foreground="#666")
-        self.status_lbl.pack(side=tk.RIGHT)
+        # Header: title + workspace + status + big Refresh
+        header = ttk.Frame(self.root, padding=(12,10,12,6))
+        header.pack(fill=tk.X)
+        # left title
+        title = ttk.Frame(header)
+        title.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(title, text="Get Syncd", font=("SF Pro Display", 18, "bold")).pack(anchor="w")
+        ttk.Label(title, text=f"All timelines live in  {self.repo}  — you don't need to hunt for files. Just Export → Save here.", foreground="#666", font=("SF Pro Text", 10)).pack(anchor="w", pady=(2,0))
 
-        # middle: left log + branches, right diff/preview
-        paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        # right: status + refresh
+        right = ttk.Frame(header)
+        right.pack(side=tk.RIGHT)
+        self.status_var = tk.StringVar(value="—")
+        self.status_lbl = ttk.Label(right, textvariable=self.status_var, font=("SF Pro Text", 11, "bold"), foreground="#666")
+        self.status_lbl.pack(anchor="e")
+        self.refresh_btn = ttk.Button(right, text="↻  Refresh", command=self._refresh_all)
+        self.refresh_btn.pack(anchor="e", pady=(4,0))
 
-        left = ttk.Frame(paned)
-        paned.add(left, weight=1)
-        # branches row
-        br = ttk.Frame(left)
-        br.pack(fill=tk.X, pady=(0,4))
-        ttk.Label(br, text="Branch:").pack(side=tk.LEFT)
-        self.branch_var = tk.StringVar()
-        self.branch_combo = ttk.Combobox(br, textvariable=self.branch_var, width=16, state="readonly")
-        self.branch_combo.pack(side=tk.LEFT, padx=6)
-        ttk.Button(br, text="New branch", command=self._new_branch).pack(side=tk.LEFT, padx=4)
-        ttk.Button(br, text="Switch", command=self._switch_branch).pack(side=tk.LEFT)
-        # log tree
-        cols = ("#", "Version", "Date", "Message")
-        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=14)
-        for c, w in zip(cols, (40, 90, 90, 420)):
-            self.tree.heading(c, text=c)
-            self.tree.column(c, width=w, anchor="w")
-        self.tree.pack(fill=tk.BOTH, expand=True)
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
-        # buttons under log
-        btns = ttk.Frame(left)
-        btns.pack(fill=tk.X, pady=6)
-        ttk.Button(btns, text="Diff selected → latest", command=lambda: self._diff_selected()).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Change to this version", command=lambda: self._restore_selected()).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="View in browser", command=lambda: self._view_selected()).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="Refresh", command=self._refresh_all).pack(side=tk.RIGHT, padx=2)
+        # Big friendly action bar
+        bar = ttk.Frame(self.root, padding=(12,6,12,8))
+        bar.pack(fill=tk.X)
+        # Use tk.Button for colored big buttons (ttk hard to color)
+        self.export_btn = tk.Button(bar, text="①  Export from Resolve", command=self._export, bg="#0a84ff", fg="white", activebackground="#0060df", font=("SF Pro Text", 12, "bold"), padx=18, pady=10, bd=0, relief="flat", cursor="hand2")
+        self.export_btn.pack(side=tk.LEFT, padx=(0,8))
+        self.save_btn = tk.Button(bar, text="②  Save version", command=self._save, bg="#30d158", fg="white", activebackground="#28a745", font=("SF Pro Text", 12, "bold"), padx=18, pady=10, bd=0, relief="flat", cursor="hand2")
+        self.save_btn.pack(side=tk.LEFT, padx=8)
 
-        right = ttk.Frame(paned)
-        paned.add(right, weight=1)
-        ttk.Label(right, text="What changed / Preview:").pack(anchor="w")
-        self.diff_text = tk.Text(right, height=18, wrap=tk.WORD, font=("Menlo", 11))
-        self.diff_text.pack(fill=tk.BOTH, expand=True, pady=4)
-        # message entry
-        msgf = ttk.Frame(right)
-        msgf.pack(fill=tk.X, pady=6)
-        ttk.Label(msgf, text="Note for next save:").pack(anchor="w")
+        # note field
+        note_fr = ttk.Frame(bar)
+        note_fr.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=12)
+        ttk.Label(note_fr, text="Note for this save:").pack(anchor="w")
         self.msg_var = tk.StringVar()
-        ttk.Entry(msgf, textvariable=self.msg_var).pack(fill=tk.X, pady=2)
-        # action row
-        act = ttk.Frame(right)
-        act.pack(fill=tk.X, pady=6)
-        ttk.Button(act, text="① Export from Resolve", command=self._export).pack(side=tk.LEFT, padx=4)
-        ttk.Button(act, text="② Save version", command=self._save).pack(side=tk.LEFT, padx=4)
-        self.watch_btn = ttk.Button(act, text="Watch: OFF", command=self._toggle_watch)
-        self.watch_btn.pack(side=tk.LEFT, padx=12)
-        ttk.Button(act, text="Push to GitHub", command=self._push).pack(side=tk.RIGHT, padx=4)
+        self.msg_entry = ttk.Entry(note_fr, textvariable=self.msg_var, font=("SF Pro Text", 11))
+        self.msg_entry.pack(fill=tk.X, pady=(2,0))
+        self.msg_entry.bind("<Return>", lambda e: self._save())
 
-        # bottom hint
-        self.hint = ttk.Label(self.root, text="Tip: leave this window open beside Resolve. Click Export → Save. Pick any old version → Change to this version.", foreground="#888", wraplength=920, justify=tk.LEFT)
-        self.hint.pack(fill=tk.X, padx=8, pady=(0,8))
+        # watch toggle
+        self.watch_btn = tk.Button(bar, text="Watch: ON", command=self._toggle_watch, bg="#5856d6", fg="white", font=("SF Pro Text", 10, "bold"), padx=12, pady=8, bd=0, relief="flat", cursor="hand2")
+        self.watch_btn.pack(side=tk.LEFT, padx=8)
+        # branch switcher compact
+        bf = ttk.Frame(bar)
+        bf.pack(side=tk.RIGHT)
+        ttk.Label(bf, text="Branch:").pack(side=tk.LEFT)
+        self.branch_var = tk.StringVar()
+        self.branch_combo = ttk.Combobox(bf, textvariable=self.branch_var, width=14, state="readonly", font=("SF Pro Text", 10))
+        self.branch_combo.pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="New", command=self._new_branch, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bf, text="Switch", command=self._switch_branch, width=7).pack(side=tk.LEFT)
 
-    def _browse(self):
-        d = filedialog.askdirectory(initialdir=str(self.repo))
-        if d:
-            self.repo = Path(d)
-            self.repo_var.set(d)
-            self._refresh_all()
+        # Main paned: left history + tree, center preview/diff
+        paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
 
-    def _init(self):
-        try:
-            git_store.init_repo(self.repo)
-            messagebox.showinfo("Initialized", f"Get Syncd project ready at\n{self.repo}")
-            self._refresh_all()
-        except Exception as e:
-            messagebox.showerror("Init failed", str(e))
+        # Left: history list + git tree
+        left = ttk.Frame(paned)
+        paned.add(left, weight=2)
+        # history label
+        ttk.Label(left, text="History — click any version to preview", font=("SF Pro Text", 11, "bold")).pack(anchor="w", pady=(0,4))
 
+        # Tree with preview thumb column (we fake thumb via text if PIL missing)
+        cols = ("#", "Preview", "Version", "What changed", "Date")
+        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=14)
+        widths = {"#": 36, "Preview": 86, "Version": 86, "What changed": 320, "Date": 86}
+        for c in cols:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=widths[c], anchor="w")
+        # scrollbar
+        scr = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scr.set)
+        tree_fr = ttk.Frame(left)
+        tree_fr.pack(fill=tk.BOTH, expand=True)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, in_=tree_fr)
+        scr.pack(side=tk.RIGHT, fill=tk.Y, in_=tree_fr)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
+
+        # action row under tree
+        tbtn = ttk.Frame(left)
+        tbtn.pack(fill=tk.X, pady=6)
+        tk.Button(tbtn, text="↔ Diff vs latest", command=self._diff_selected, bg="#f2f2f7", font=("SF Pro Text", 10), padx=10, pady=6, bd=0, relief="flat", cursor="hand2").pack(side=tk.LEFT, padx=2)
+        self.change_btn = tk.Button(tbtn, text="↩ Change to this version", command=self._restore_selected, bg="#ff9f0a", fg="white", font=("SF Pro Text", 10, "bold"), padx=12, pady=6, bd=0, relief="flat", cursor="hand2")
+        self.change_btn.pack(side=tk.LEFT, padx=6)
+        tk.Button(tbtn, text="View", command=self._view_selected, bg="#f2f2f7", font=("SF Pro Text", 10), padx=10, pady=6, bd=0, relief="flat").pack(side=tk.LEFT, padx=2)
+        tk.Button(tbtn, text="Push", command=self._push, bg="#f2f2f7", font=("SF Pro Text", 10), padx=10, pady=6, bd=0, relief="flat").pack(side=tk.RIGHT)
+
+        # git tree visualiser (collapsible)
+        tree_box = ttk.LabelFrame(left, text="Git tree", padding=6)
+        tree_box.pack(fill=tk.BOTH, expand=False, pady=(6,0))
+        self.git_text = tk.Text(tree_box, height=7, font=("Menlo", 10), wrap=tk.NONE, bg="#1c1c1e", fg="#e5e5e5", bd=0, padx=6, pady=4)
+        self.git_text.pack(fill=tk.BOTH, expand=True)
+        # horizontal scroll for graph
+        gs = ttk.Scrollbar(tree_box, orient=tk.HORIZONTAL, command=self.git_text.xview)
+        self.git_text.configure(xscrollcommand=gs.set)
+        gs.pack(fill=tk.X)
+
+        # Right: preview + diff
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+        ttk.Label(right, text="Preview + What changed", font=("SF Pro Text", 11, "bold")).pack(anchor="w", pady=(0,4))
+
+        # Preview image area
+        self.preview_lbl = tk.Label(right, text="Preview will appear here", bg="#1c1c1e", fg="#888", width=60, height=8, anchor="center", relief="flat")
+        self.preview_lbl.pack(fill=tk.X, pady=(0,6))
+
+        # Diff text
+        self.diff_text = tk.Text(right, height=14, wrap=tk.WORD, font=("Menlo", 11), bg="#f2f2f7", bd=0, padx=8, pady=6)
+        self.diff_text.pack(fill=tk.BOTH, expand=True)
+        # make diff text read-only style
+        self.diff_text.configure(state="disabled")
+
+        # hint bar
+        self.hint = ttk.Label(self.root, text="Keep this window beside Resolve. Export → type a note → Save. Pick any old version → Change to this version. Use Refresh if you exported manually to ~/GetSyncd/timeline.otio", foreground="#666", wraplength=1060, justify=tk.LEFT, font=("SF Pro Text", 10))
+        self.hint.pack(fill=tk.X, padx=12, pady=(4,10))
+
+    # ---------- refresh (fixes "didn't detect") ----------
     def _refresh_all(self):
-        self.repo = Path(self.repo_var.get()).expanduser().resolve()
-        self.repo.mkdir(parents=True, exist_ok=True)
+        # Re-resolve repo (may have been moved) and ensure workspace
+        try:
+            self.repo.mkdir(parents=True, exist_ok=True)
+            if not git_store.is_git_repo(self.repo):
+                git_store.init_repo(self.repo)
+        except Exception:
+            pass
+
         # status
         try:
             res = git_store.status(self.repo)
             msg = res.get("message", "")
             has = res.get("has_changes")
             if has is True:
-                self.status_lbl.config(text="● Unsaved changes", foreground="#d98300")
+                self.status_var.set("● Unsaved changes — click Save")
+                self.status_lbl.configure(foreground="#d98300")
+                self.save_btn.configure(bg="#ff3b30")
             elif has is False:
-                self.status_lbl.config(text="✓ Up to date", foreground="#1a8a4a")
+                self.status_var.set("✓ Up to date")
+                self.status_lbl.configure(foreground="#30d158")
+                self.save_btn.configure(bg="#30d158")
             else:
-                self.status_lbl.config(text=msg[:60], foreground="#666")
-            # also update diff preview for unsaved changes vs HEAD
+                self.status_var.set(msg[:70])
+                self.status_lbl.configure(foreground="#666")
+
+            # update diff preview for unsaved changes
             if has is True:
                 try:
-                    # quick changelog diff vs HEAD
                     with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tmp:
                         tp = tmp.name
                     try:
@@ -234,10 +315,7 @@ class SidecarApp:
                         old = parse_otio_file(tp)
                         new = parse_otio_file(self.repo / "timeline.otio")
                         d = diff_timelines(old, new)
-                        self.diff_text.delete("1.0", tk.END)
-                        self.diff_text.insert(tk.END, f"Unsaved changes vs last save:\n{changelog_line(d)}\n\n")
-                        for ch in d.changes:
-                            self.diff_text.insert(tk.END, f"  {ch.type} {ch.clip_name} {ch.details}\n")
+                        self._set_diff_text(f"Unsaved vs last save:\n{changelog_line(d)}\n\n" + "\n".join(f"  {ch.type:12} {ch.clip_name}" for ch in d.changes[:12]))
                         if not self.msg_var.get():
                             self.msg_var.set(changelog_line(d))
                     finally:
@@ -245,8 +323,13 @@ class SidecarApp:
                         except: pass
                 except Exception:
                     pass
+            else:
+                # show hint when up to date
+                self._set_diff_text("No unsaved changes. Edit in Resolve, then Export → Save.")
         except Exception as e:
-            self.status_lbl.config(text=str(e)[:80], foreground="#c00")
+            self.status_var.set(str(e)[:80])
+            self.status_lbl.configure(foreground="#c00")
+
         # branches
         try:
             branches = _get_branches(self.repo)
@@ -256,35 +339,89 @@ class SidecarApp:
             self.branch_var.set(cur_name or (branches[0] if branches else ""))
         except Exception:
             pass
+
         # log
         for i in self.tree.get_children():
             self.tree.delete(i)
+        self._preview_images.clear()
         try:
             versions = git_store.log_versions(self.repo, limit=50)
             for i, v in enumerate(versions):
+                # ensure preview exists
+                p = _preview_path(self.repo, v["hash"])
+                if not p.exists():
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tmp:
+                            tp = Path(tmp.name)
+                        git_store.restore_version(self.repo, v["hash"], tp)
+                        generate_preview(self.repo, v["hash"], tp)
+                        tp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                # thumb: show file existence indicator
+                thumb = "▬▬" if p.exists() else "…"
                 tag = "latest" if i == 0 else ""
-                self.tree.insert("", tk.END, values=(i+1, v["short"] + (" ← latest" if tag else ""), v["date"], v["message"]))
+                self.tree.insert("", tk.END, values=(i+1, thumb, v["short"] + (" ← latest" if tag else ""), v["message"][:60], v["date"]))
         except Exception as e:
-            self.diff_text.delete("1.0", tk.END)
-            self.diff_text.insert(tk.END, f"Error loading log: {e}\n")
+            self._set_diff_text(f"Log error: {e}")
+
+        # git tree visualiser
+        try:
+            graph = get_git_graph(self.repo)
+            self.git_text.configure(state="normal")
+            self.git_text.delete("1.0", tk.END)
+            self.git_text.insert(tk.END, graph)
+            self.git_text.configure(state="disabled")
+        except Exception:
+            pass
+
+        # highlight refresh
+        orig = self.refresh_btn.cget("text")
+        self.refresh_btn.config(text="✓ Refreshed")
+        self.root.after(900, lambda: self.refresh_btn.config(text="↻  Refresh"))
+
+    def _set_diff_text(self, s: str):
+        self.diff_text.configure(state="normal")
+        self.diff_text.delete("1.0", tk.END)
+        self.diff_text.insert(tk.END, s)
+        self.diff_text.configure(state="disabled")
 
     def _on_select(self):
         sel = self.tree.selection()
         if not sel:
             return
         vals = self.tree.item(sel[0], "values")
-        num = str(vals[0])
+        try:
+            num = int(vals[0])
+        except:
+            return
+        # Update preview image for selected version
         try:
             versions = git_store.log_versions(self.repo, limit=50)
-            idx = int(num)-1
+            idx = num - 1
             if 0 <= idx < len(versions):
-                rev = versions[idx]["hash"]
-                # show diff vs latest (or vs previous if latest selected)
-                other = versions[0]["hash"] if idx != 0 else (versions[1]["hash"] if len(versions)>1 else rev)
-                a = other if idx==0 else rev
-                b = rev if idx==0 else versions[0]["hash"]
-                # use git revs via temp
-                import tempfile
+                v = versions[idx]
+                p = _preview_path(self.repo, v["hash"])
+                if HAS_PIL_TK and p.exists() and p.stat().st_size > 100:
+                    try:
+                        img = Image.open(p)
+                        # scale to fit ~ 520px wide
+                        w, h = img.size
+                        target_w = 540
+                        scale = target_w / w
+                        img2 = img.resize((target_w, int(h*scale)), Image.LANCZOS)
+                        tkimg = ImageTk.PhotoImage(img2)
+                        self._preview_images["sel"] = tkimg
+                        self.preview_lbl.config(image=tkimg, text="", bg="#1c1c1e")
+                    except Exception:
+                        self.preview_lbl.config(text=f"Preview: {v['short']} — {v['message']}", image="", bg="#1c1c1e")
+                else:
+                    self.preview_lbl.config(text=f"Preview: {v['short']} — {v['message']}", image="", bg="#1c1c1e")
+
+                # diff vs latest
+                other = versions[0]["hash"] if idx != 0 else (versions[1]["hash"] if len(versions)>1 else v["hash"])
+                a = other if idx==0 else v["hash"]
+                b = v["hash"] if idx==0 else versions[0]["hash"]
                 with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as ta:
                     pa = ta.name
                 with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tb:
@@ -294,52 +431,47 @@ class SidecarApp:
                     git_store.restore_version(self.repo, b, pb)
                     old = parse_otio_file(pa); new = parse_otio_file(pb)
                     d = diff_timelines(old, new)
-                    self.diff_text.delete("1.0", tk.END)
-                    self.diff_text.insert(tk.END, f"Diff {num} vs latest:\n{changelog_line(d)}\n\n")
-                    for ch in d.changes:
-                        self.diff_text.insert(tk.END, f"{ch.type:12} {ch.clip_name}  {ch.details}\n")
+                    txt = f"Version {num} vs latest:\n{changelog_line(d)}\n\n" + "\n".join(f"{ch.type:12} {ch.clip_name}  {str(ch.details)[:80]}" for ch in d.changes[:20])
+                    self._set_diff_text(txt)
                 finally:
-                    for p in (pa,pb):
-                        try: Path(p).unlink()
+                    for pp in (pa,pb):
+                        try: Path(pp).unlink()
                         except: pass
         except Exception as e:
-            self.diff_text.delete("1.0", tk.END)
-            self.diff_text.insert(tk.END, f"Diff error: {e}\n")
+            self._set_diff_text(f"Preview error: {e}")
 
+    # ---------- actions ----------
     def _export(self):
         out = self.repo / "timeline.otio"
-        # prefer env override
         env_out = os.environ.get("GET_SYNCD_OUT")
         if env_out:
             out = Path(env_out).expanduser()
         ok, msg = _try_resolve_export(out)
         if ok:
-            messagebox.showinfo("Exported", msg)
+            messagebox.showinfo("Exported", msg + f"\n\nNow add a note and click Save. All files stay in {self.repo}")
             self._refresh_all()
         else:
-            # show fallback dialog
             manual = (
-                f"{msg}\n\nManual fallback (always works):\n"
-                f"1) In Resolve: File → Export Timeline → OpenTimelineIO\n"
+                f"{msg}\n\nManual (always works):\n"
+                f"1) Resolve → File → Export Timeline → OpenTimelineIO\n"
                 f"2) Save as: {out}\n"
-                f"3) Come back here and click 'Save version'."
+                f"3) Come back and click Refresh → Save"
             )
-            messagebox.showwarning("Export — manual step needed", manual)
-            # also show in diff pane
-            self.diff_text.delete("1.0", tk.END)
-            self.diff_text.insert(tk.END, manual + "\n")
+            messagebox.showwarning("Export — manual step", manual)
+            self._set_diff_text(manual)
 
     def _save(self):
         msg = self.msg_var.get().strip()
+        src = self.repo / "timeline.otio"
+        if not src.exists():
+            cands = list(self.repo.glob("*.otio"))
+            if cands:
+                src = cands[0]
+            else:
+                messagebox.showerror("No timeline", f"No {src} yet. Click Export or File → Export Timeline → OpenTimelineIO → {src}")
+                return
         if not msg:
-            # auto
             try:
-                # try auto changelog diff vs HEAD
-                import tempfile
-                src = self.repo / "timeline.otio"
-                if not src.exists():
-                    messagebox.showerror("No timeline", f"No {src} yet. Click Export first.")
-                    return
                 with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tmp:
                     tp = tmp.name
                 try:
@@ -355,17 +487,13 @@ class SidecarApp:
             except Exception:
                 msg = "Save version"
         try:
-            src = self.repo / "timeline.otio"
-            if not src.exists():
-                # try any otio in repo
-                cands = list(self.repo.glob("*.otio"))
-                if cands:
-                    src = cands[0]
-                else:
-                    messagebox.showerror("No file", "Export from Resolve first (timeline.otio not found).")
-                    return
             h = git_store.save_version(self.repo, src, msg)
-            messagebox.showinfo("Saved", f"Version {h[:8]}:\n{msg}")
+            # generate preview for new version
+            try:
+                generate_preview(self.repo, h, src)
+            except Exception:
+                pass
+            messagebox.showinfo("Saved", f"Version {h[:8]}:\n{msg}\n\nStored in {self.repo} — no hunting needed.")
             self.msg_var.set("")
             self._refresh_all()
         except ValueError as e:
@@ -376,31 +504,23 @@ class SidecarApp:
     def _diff_selected(self):
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("Pick one", "Select a version in the list first.")
+            messagebox.showinfo("Pick one", "Select a version first.")
             return
-        vals = self.tree.item(sel[0], "values")
-        num = str(vals[0])
-        # diff num vs latest (1)
-        try:
-            # reuse _on_select diff already shown; also pop viewer?
-            self._on_select()
-        except Exception as e:
-            messagebox.showerror("Diff failed", str(e))
+        self._on_select()
 
     def _restore_selected(self):
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("Pick one", "Select a version to restore first.")
+            messagebox.showinfo("Pick one", "Select a version to restore.")
             return
         vals = self.tree.item(sel[0], "values")
         num = str(vals[0])
-        if not messagebox.askyesno("Change to this version?", f"Overwrite timeline.otio with version {num} ({vals[1]})?\n\nThis becomes your current timeline. Next Resolve import will show it.\nCurrent timeline.otio will be backed up to .get-syncd/backups/."):
+        if not messagebox.askyesno("Change to this version?", f"Overwrite {self.repo / 'timeline.otio'} with version {num} ({vals[2]})?\n\nThis becomes your current timeline. Next Resolve import will show it.\nBackup saved to .get-syncd/backups/."):
             return
         try:
             versions = git_store.log_versions(self.repo, limit=50)
             idx = int(num)-1
             rev = versions[idx]["hash"] if 0 <= idx < len(versions) else num
-            # backup
             out = self.repo / "timeline.otio"
             if out.exists():
                 bdir = self.repo / ".get-syncd" / "backups"
@@ -409,28 +529,24 @@ class SidecarApp:
                 ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
                 shutil.copy2(str(out), str(bdir / f"timeline-{ts}.otio"))
             git_store.restore_version(self.repo, rev, out)
-            messagebox.showinfo("Changed", f"Now using version {num} ({vals[1]}).\n\nIn Resolve: File → Import Timeline → OpenTimelineIO → timeline.otio\n(or re-import).")
+            messagebox.showinfo("Changed", f"Now using version {num}.\n\nResolve → File → Import Timeline → OpenTimelineIO → {out}")
             self._refresh_all()
         except Exception as e:
             messagebox.showerror("Restore failed", str(e))
 
     def _view_selected(self):
-        sel = self.tree.selection()
         versions = git_store.log_versions(self.repo, limit=50)
         if len(versions) < 2:
-            messagebox.showinfo("Need 2 versions", "Save at least 2 versions to view a diff.")
+            messagebox.showinfo("Need 2", "Save at least 2 versions to view.")
             return
+        sel = self.tree.selection()
         if sel:
-            vals = self.tree.item(sel[0], "values")
-            num = str(vals[0])
-            idx = int(num)-1
-            a = versions[idx]["hash"]
-            b = versions[0]["hash"]
+            vals = self.tree.item(sel[0], "values"); idx = int(vals[0])-1
+            a = versions[idx]["hash"]; b = versions[0]["hash"]
         else:
             a = versions[1]["hash"]; b = versions[0]["hash"]
         try:
             from .viewer.app import run_viewer
-            import threading
             threading.Thread(target=lambda: run_viewer(self.repo, a, b, open_browser=True), daemon=True).start()
         except Exception as e:
             messagebox.showerror("Viewer failed", str(e))
@@ -451,7 +567,6 @@ class SidecarApp:
         try:
             _switch_branch(self.repo, name)
             self._refresh_all()
-            messagebox.showinfo("Switched", f"Now on '{name}'")
         except Exception as e:
             messagebox.showerror("Switch failed", str(e))
 
@@ -460,51 +575,56 @@ class SidecarApp:
             out = git_store.push(self.repo)
             messagebox.showinfo("Pushed", out or "Pushed to GitHub.")
         except Exception as e:
-            messagebox.showerror("Push failed", str(e) + "\n\nTip: git remote -v ; gh auth login")
+            messagebox.showerror("Push failed", str(e))
 
     def _toggle_watch(self):
         if self._watching:
             self._watching = False
-            self.watch_btn.config(text="Watch: OFF")
+            self.watch_btn.config(text="Watch: OFF", bg="#5856d6")
             return
         self._watching = True
-        self.watch_btn.config(text="Watch: ON")
+        self.watch_btn.config(text="Watch: ON", bg="#30d158")
         def loop():
             last = ""
-            watch_file = self.repo / "timeline.otio"
-            if watch_file.exists():
-                try: last = git_store.file_hash(watch_file)
-                except: last = str(watch_file.stat().st_mtime)
+            wf = self.repo / "timeline.otio"
+            if wf.exists():
+                try: last = git_store.file_hash(wf)
+                except: last = str(wf.stat().st_mtime)
             while self._watching:
                 time.sleep(2.0)
-                if not watch_file.exists(): continue
+                if not wf.exists(): continue
                 try:
-                    cur = git_store.file_hash(watch_file)
+                    cur = git_store.file_hash(wf)
                 except: continue
                 if cur != last:
                     last = cur
-                    # schedule UI update
                     try:
-                        self.root.after(0, lambda: self._on_watch_change())
+                        self.root.after(0, lambda: self._refresh_all())
+                        self.root.after(200, lambda: self._on_watch_prompt())
                     except: pass
         threading.Thread(target=loop, daemon=True).start()
 
-    def _on_watch_change(self):
-        self._refresh_all()
-        # prompt
-        if messagebox.askyesno("Change detected", "timeline.otio changed (Resolve export?). Save as new version?"):
-            self._save()
+    def _on_watch_prompt(self):
+        # subtle: just refresh, don't spam popup — status already shows unsaved
+        # optionally prompt
+        pass
 
     def run(self):
         self.root.mainloop()
 
-
 def run_gui(repo: Path):
+    # normalize to workspace if user launched from app folder or no repo
+    if not repo or str(repo) == ".":
+        repo = DEFAULT_WORKSPACE
+    repo = Path(repo).expanduser().resolve()
+    # If repo is the app source (contains src/get_syncd), redirect to workspace
+    if (repo / "src" / "get_syncd").exists() and (repo / "pyproject.toml").exists():
+        repo = DEFAULT_WORKSPACE
+    repo.mkdir(parents=True, exist_ok=True)
+    if not git_store.is_git_repo(repo):
+        git_store.init_repo(repo)
     if not HAS_TK:
-        print("Tkinter not available (python-tk missing). Fallback:", file=sys.stderr)
-        print("  get-syncd watch  # in one terminal", file=sys.stderr)
-        print("  get-syncd log / diff / restore --apply  # in another", file=sys.stderr)
-        print("\nInstall Tk on macOS: brew install python-tk  (or use python.org Python which includes Tk)", file=sys.stderr)
+        print("Tkinter missing — fallback: get-syncd watch", file=sys.stderr)
         sys.exit(1)
     app = SidecarApp(repo)
     app.run()
