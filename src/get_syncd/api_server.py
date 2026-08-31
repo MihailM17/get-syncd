@@ -11,6 +11,9 @@ Endpoints:
   GET  /api/diff?repo=PATH&a=REV&b=REV
   POST /api/save  {repo, file, message}
   POST /api/restore {repo, rev, apply}
+  GET  /api/projects -> list of ~/GetSyncd sub-projects
+  GET  /api/resolve/projects -> scan Resolve DB
+  POST /api/resolve/scan -> scan + auto-create folders
   GET  /api/preview?repo=PATH&hash=SHORT  -> PNG
   GET  /health
 
@@ -69,6 +72,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}, status=500)
             return
+        if parsed.path == "/api/projects":
+            self._json(core_api.api_list_projects())
+            return
+        if parsed.path == "/api/resolve/projects":
+            self._json(core_api.api_scan_resolve_projects())
+            return
         if parsed.path == "/api/preview":
             h = qs.get("hash", [""])[0]
             if not h:
@@ -113,6 +122,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/branch":
             res = core_api.api_create_branch(repo, name=data.get("name", ""))
+            self._json(res, status=200 if res.get("ok") else 400)
+            return
+        if parsed.path == "/api/resolve/scan":
+            res = core_api.api_scan_resolve_projects()
             self._json(res, status=200 if res.get("ok") else 400)
             return
         self.send_error(404, f"Unknown POST {parsed.path}")

@@ -225,7 +225,9 @@ def api_restore(repo: str | Path | None = None, rev: str = "HEAD", apply: bool =
                 ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
                 shutil.copy2(str(out_path), str(bdir / f"timeline-{ts}.otio"))
             git_store.restore_version(r, rev_resolved, out_path)
-            return {"ok": True, "rev": rev, "resolved": rev_resolved, "out": str(out_path), "applied": True, "safety": safety, "repo": str(r)}
+            # try auto-import into Resolve so reopen shows restored version without manual File→Import
+            auto_import_ok, auto_import_msg = _try_resolve_import(out_path)
+            return {"ok": True, "rev": rev, "resolved": rev_resolved, "out": str(out_path), "applied": True, "safety": safety, "repo": str(r), "auto_import": auto_import_ok, "auto_import_msg": auto_import_msg}
         else:
             out_path = Path(out).expanduser() if out else Path(f"version-{rev}.otio")
             git_store.restore_version(r, rev_resolved, out_path)
@@ -257,3 +259,143 @@ def api_create_branch(repo: str | Path | None = None, name: str = "") -> dict:
         return {"ok": True, "branch": name, "repo": str(r), "created": True}
     except subprocess.CalledProcessError as e:
         return {"ok": False, "error": e.stderr.strip() if e.stderr else str(e)}
+
+def api_list_projects() -> dict:
+    """List all Get Syncd projects (subfolders of ~/GetSyncd that are git repos)."""
+    base = DEFAULT_REPO
+    base.mkdir(parents=True, exist_ok=True)
+    if not base.exists():
+        return {"ok": True, "projects": []}
+    projects = []
+    # include base itself if it's a repo (the default single-project case) and not hidden
+    if (base / ".git").exists():
+        projects.append({"name": base.name, "path": str(base), "is_base": True})
+    for p in base.iterdir():
+        if p.name.startswith("."):
+            continue
+        if p.is_dir() and (p / ".git").exists():
+            projects.append({"name": p.name, "path": str(p), "is_base": False})
+    return {"ok": True, "projects": sorted(projects, key=lambda x: (not x["is_base"], x["name"]))}
+
+def api_scan_resolve_projects() -> dict:
+    """Ask DaVinci Resolve for project list and auto-create folders."""
+    base = DEFAULT_REPO
+    base.mkdir(parents=True, exist_ok=True)
+    resolve = None
+    try:
+        for pp in [
+            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
+            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
+        ]:
+            if pp not in __import__("sys").path and Path(pp).exists():
+                __import__("sys").path.append(pp)
+        import DaVinciResolveScript as bmd  # type: ignore
+        resolve = bmd.scriptapp("Resolve")
+    except Exception as e:
+        existing = api_list_projects()
+        return {"ok": False, "error": f"Resolve not running or External scripting not enabled. Open Resolve with a project, enable Preferences → System → General → External scripting: Local, then try again. ({e})", "projects": [], "folders": existing.get("projects", [])}
+    if not resolve:
+        existing = api_list_projects()
+        return {"ok": False, "error": "Could not connect to Resolve — is it running?", "projects": [], "folders": existing.get("projects", [])}
+    try:
+        pm = resolve.GetProjectManager()
+        if not pm:
+            existing = api_list_projects()
+            return {"ok": False, "error": "Resolve: No ProjectManager — is Resolve running with a project open?", "projects": [], "folders": existing.get("projects", [])}
+        # try Root folder, fallback to empty folder — handle API variations
+        names = None
+        for folder_arg in ["Root", "", None]:
+            try:
+                meth = getattr(pm, "GetProjectListInFolder", None)
+                if meth and callable(meth):
+                    if folder_arg is None:
+                        names = meth()
+                    else:
+                        names = meth(folder_arg)
+                else:
+                    names = None
+            except Exception:
+                names = None
+            if names:
+                break
+        if not names:
+            # try current project name as fallback
+            try:
+                cur = pm.GetCurrentProject()
+                if cur and hasattr(cur, "GetName"):
+                    n = cur.GetName()
+                    if n:
+                        names = [n]
+            except Exception:
+                pass
+        if not names:
+            names = []
+        created = []
+        for raw in names:
+            name = str(raw).strip()
+            if not name:
+                continue
+            # sanitize folder name
+            safe = "".join(c if c.isalnum() or c in " -_." else "_" for c in name).strip()
+            if not safe:
+                safe = name
+            folder = base / safe
+            folder.mkdir(parents=True, exist_ok=True)
+            if not git_store.is_git_repo(folder):
+                git_store.init_repo(folder)
+                created.append(safe)
+        # also return existing GetSyncd projects
+        existing = api_list_projects()
+        return {"ok": True, "projects": names, "created": created, "folders": existing.get("projects", [])}
+    except Exception as e:
+        existing = api_list_projects()
+        return {"ok": False, "error": f"Scan failed: {e} — showing existing GetSyncd projects.", "projects": [], "folders": existing.get("projects", [])}
+
+def _try_resolve_import(otio_path: Path) -> tuple[bool, str]:
+    """Try to auto-import OTIO into current Resolve project (best-effort)."""
+    otio_path = Path(otio_path).resolve()
+    if not otio_path.exists():
+        return False, f"File not found: {otio_path}"
+    resolve = None
+    try:
+        for pp in [
+            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
+            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
+        ]:
+            if pp not in __import__("sys").path and Path(pp).exists():
+                __import__("sys").path.append(pp)
+        import DaVinciResolveScript as bmd  # type: ignore
+        resolve = bmd.scriptapp("Resolve")
+    except Exception as e:
+        return False, f"Resolve API not reachable: {e}"
+    if not resolve:
+        return False, "Could not connect to Resolve"
+    try:
+        pm = resolve.GetProjectManager()
+        project = pm.GetCurrentProject() if pm else None
+        if not project:
+            return False, "No project open in Resolve — open a project first"
+        # Try several import methods (vary by version)
+        # 1) MediaPool.ImportMedia
+        try:
+            mp = project.GetMediaPool()
+            if mp and hasattr(mp, "ImportMedia"):
+                # ImportMedia expects list
+                res = mp.ImportMedia([str(otio_path)])
+                if res:
+                    return True, f"Imported via MediaPool.ImportMedia → {otio_path.name}"
+        except Exception:
+            pass
+        # 2) Timeline import via Project
+        for meth in ["ImportTimeline", "LoadTimeline", "ImportOTIO"]:
+            if hasattr(project, meth):
+                try:
+                    ok = getattr(project, meth)(str(otio_path))
+                    if ok:
+                        return True, f"Imported via Project.{meth}"
+                except Exception:
+                    continue
+        # 3) Try Fusion? fallback
+        return False, "Auto-import not available in this Resolve version — use File → Import Timeline → OpenTimelineIO → timeline.otio"
+    except Exception as e:
+        return False, f"Import error: {e}"

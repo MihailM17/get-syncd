@@ -18,11 +18,32 @@ export default function App() {
   const [showSetup, setShowSetup] = useState(false)
   const [syncStep, setSyncStep] = useState<string | null>(null)
   const [folder, setFolder] = useState(DEFAULT_REPO)
+  const [projects, setProjects] = useState<{name:string,path:string}[]>([])
 
   const api = async (path: string, opts?: RequestInit) => {
     const url = `${API}${path}${path.includes('?') ? '&' : '?'}repo=${encodeURIComponent(repo)}`
     const r = await fetch(url, opts)
     return r.json()
+  }
+
+  const refreshProjects = async () => {
+    try {
+      const r = await fetch(`${API}/api/projects`).then(x=>x.json())
+      if (r.ok) setProjects(r.projects || [])
+    } catch {}
+  }
+
+  const scanResolve = async () => {
+    const r = await fetch(`${API}/api/resolve/scan`, {method:'POST'}).then(x=>x.json())
+    // always refresh tabs, even if Resolve not running — show existing GetSyncd projects
+    refreshProjects(); refresh()
+    if (!r.ok) {
+      const hint = r.folders?.length ? `\n\nExisting projects: ${r.folders.map((f:any)=>f.name).join(', ')}` : ''
+      alert((r.error || 'Resolve not running') + hint + '\n\nYou can still Create Project manually with the button or type a name.')
+      return
+    }
+    if (r.created?.length) alert(`Created folders for: ${r.created.join(', ')}`)
+    else if (!r.projects?.length) alert(`No Resolve projects found — open a project in Resolve first. Existing GetSyncd projects shown.`)
   }
 
   const refresh = async () => {
@@ -43,7 +64,8 @@ export default function App() {
     } catch (e) { console.error(e) }
   }
 
-  useEffect(() => { refresh(); const id=setInterval(refresh, 3000); return ()=>clearInterval(id) }, [repo])
+  useEffect(() => { refreshProjects(); refresh(); const id=setInterval(refresh, 3000); return ()=>clearInterval(id) }, [repo])
+  useEffect(()=>{ refreshProjects() }, [log.length])
   useEffect(() => {
     if (!selected || log.length<2) return
     const idx = log.findIndex(v=>v.hash===selected.hash)
@@ -75,12 +97,16 @@ export default function App() {
 
   const doRestore = async (v: Version) => {
     const hasChanges = status?.has_changes
-    let msg = `Restore to "${v.message}"?\n\nThis will become your current timeline in ~/GetSyncd/timeline.otio.\nNext: Resolve → File → Import Timeline → OpenTimelineIO → timeline.otio`
+    let msg = `Restore to "${v.message}"?\n\nThis will become your current timeline.`
     if (hasChanges) msg = `You have unsaved changes. A safety snapshot will be created first, then restore to "${v.message}".\n\nContinue?`
     if (!confirm(msg)) return
     const res = await fetch(`${API}/api/restore`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, rev: v.hash, apply: true})}).then(r=>r.json())
     if (!res.ok) { alert(`Restore failed: ${res.error}\nYour current work was not deleted.`); return }
-    alert(`Restored to ${v.short} — safety snapshot ${res.safety ? 'saved' : 'created if needed'}.\nNext: Import ~/GetSyncd/timeline.otio in Resolve. You can undo by restoring the previous version.`)
+    if (res.auto_import) {
+      alert(`Restored to ${v.short} and auto-imported into Resolve ✓\n${res.auto_import_msg}\n\nNo manual import needed — just play the timeline in Resolve. Safety snapshot ${res.safety ? 'saved' : 'created if needed'}.`)
+    } else {
+      alert(`Restored to ${v.short} — ${res.auto_import_msg || ''}\n\nIf Resolve was closed, open it and do File → Import Timeline → OpenTimelineIO → timeline.otio\nSafety snapshot ${res.safety ? 'saved' : 'created if needed'}.`)
+    }
     refresh()
   }
 
@@ -164,6 +190,16 @@ export default function App() {
       </header>
 
       {syncStep && <div className="syncbar">{syncStep}</div>}
+
+      <div className="tabs">
+        <div className="tabList">
+          {projects.map(p=>(
+            <button key={p.path} className={`tab ${repo===p.path?'active':''}`} onClick={()=>{setRepo(p.path); setSelected(null)}}>{p.name}</button>
+          ))}
+          <button className="tab add" onClick={scanResolve} title="Scan DaVinci Resolve library and auto-create folders">+ Scan Resolve</button>
+        </div>
+        <span className="tabHint">Auto-creates ~/GetSyncd/&lt;Project&gt; — pick a tab to switch projects</span>
+      </div>
 
       <div className="main">
         <aside className="history">
