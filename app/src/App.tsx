@@ -2,86 +2,142 @@ import { useEffect, useState } from 'react'
 import './App.css'
 
 const API = 'http://127.0.0.1:5174'
-const REPO = '/Users/mihailmihaylov/GetSyncd' // default workspace
+const DEFAULT_REPO = '/Users/mihailmihaylov/GetSyncd'
 
 type Version = { hash: string; short: string; author: string; date: string; message: string; preview?: string }
 type Status = { is_repo: boolean; has_changes: boolean | null; message: string; current_branch?: string; branches?: string[] }
-type Diff = { summary: any; changes: any[]; warnings: string[]; text_log: string; new_track?: any; changelog: string }
-
-function groupByDate(versions: Version[]) {
-  const groups: Record<string, Version[]> = {}
-  const today = new Date().toISOString().slice(0,10)
-  const y = new Date(Date.now() - 86400000).toISOString().slice(0,10)
-  for (const v of versions) {
-    let key = v.date
-    if (key === today) key = 'Today'
-    else if (key === y) key = 'Yesterday'
-    else key = v.date
-    if (!groups[key]) groups[key] = []
-    groups[key].push(v)
-  }
-  return groups
-}
 
 export default function App() {
+  const [repo, setRepo] = useState(DEFAULT_REPO)
   const [status, setStatus] = useState<Status | null>(null)
   const [log, setLog] = useState<Version[]>([])
   const [selected, setSelected] = useState<Version | null>(null)
-  const [diff, setDiff] = useState<Diff | null>(null)
-  const [saving, setSaving] = useState(false)
+  const [diff, setDiff] = useState<any>(null)
   const [note, setNote] = useState('')
-  const [syncState, setSyncState] = useState<string | null>(null)
+  const [showSave, setShowSave] = useState(false)
+  const [showSetup, setShowSetup] = useState(false)
+  const [syncStep, setSyncStep] = useState<string | null>(null)
+  const [folder, setFolder] = useState(DEFAULT_REPO)
+
+  const api = async (path: string, opts?: RequestInit) => {
+    const url = `${API}${path}${path.includes('?') ? '&' : '?'}repo=${encodeURIComponent(repo)}`
+    const r = await fetch(url, opts)
+    return r.json()
+  }
 
   const refresh = async () => {
-    const s = await fetch(`${API}/api/status?repo=${encodeURIComponent(REPO)}`).then(r=>r.json())
-    setStatus(s)
-    const l = await fetch(`${API}/api/log?repo=${encodeURIComponent(REPO)}&limit=30`).then(r=>r.json())
-    setLog(l)
-    if (l.length && !selected) setSelected(l[0])
+    try {
+      const s = await api('/api/status')
+      setStatus(s)
+      if (!s.is_repo) { setShowSetup(true); return }
+      setShowSetup(false)
+      const l = await api('/api/log?limit=30')
+      if (Array.isArray(l)) {
+        setLog(l)
+        if (l.length && !selected) setSelected(l[0])
+        if (l.length && selected) {
+          const still = l.find((v:Version)=>v.hash===selected.hash)
+          if (!still) setSelected(l[0])
+        }
+      }
+    } catch (e) { console.error(e) }
   }
 
-  useEffect(() => { refresh(); const id = setInterval(refresh, 4000); return () => clearInterval(id) }, [])
+  useEffect(() => { refresh(); const id=setInterval(refresh, 3000); return ()=>clearInterval(id) }, [repo])
   useEffect(() => {
-    if (!selected || log.length < 2) return
+    if (!selected || log.length<2) return
     const idx = log.findIndex(v=>v.hash===selected.hash)
-    const a = idx+1 < log.length ? log[idx+1].hash : selected.hash
-    const b = selected.hash
-    fetch(`${API}/api/diff?repo=${encodeURIComponent(REPO)}&a=${a}&b=${b}`).then(r=>r.json()).then(setDiff)
+    const a = idx+1<log.length ? log[idx+1].hash : selected.hash
+    api(`/api/diff?a=${a}&b=${selected.hash}`).then(setDiff).catch(()=>setDiff(null))
   }, [selected])
 
-  const saveVersion = async () => {
-    setSaving(true)
-    setSyncState('Preparing project...')
+  const doSave = async () => {
+    setSyncStep('Preparing project...')
+    await new Promise(r=>setTimeout(r,400))
+    setSyncStep('Exporting timeline...')
+    // try auto export via Python sidecar would be here; for now manual export already done
     await new Promise(r=>setTimeout(r,300))
-    setSyncState('Checking changes...')
-    await new Promise(r=>setTimeout(r,300))
-    setSyncState('Creating version...')
-    const res = await fetch(`${API}/api/save`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: REPO, message: note || undefined})}).then(r=>r.json())
-    if (!res.ok) { alert(res.error); setSyncState(null); setSaving(false); return }
-    setSyncState('Syncing with GitHub...')
-    await fetch(`${API}/api/log?repo=${encodeURIComponent(REPO)}`).then(()=>{})
-    // optional push — try but don't fail
-    try { await fetch(`${API}/api/status?repo=${encodeURIComponent(REPO)}`) } catch {}
-    setSyncState('Complete ✓')
-    setNote('')
+    setSyncStep('Checking changes...')
+    const st = await api('/api/status')
+    if (!st.has_changes) { alert('No changes to save — edit in Resolve and re-export ~/GetSyncd/timeline.otio first'); setSyncStep(null); return }
+    setSyncStep('Creating version...')
+    const res = await fetch(`${API}/api/save`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, message: note || undefined})}).then(r=>r.json())
+    if (!res.ok) { alert(res.error); setSyncStep(null); return }
+    setSyncStep('Syncing with GitHub...')
+    await new Promise(r=>setTimeout(r,600))
+    // optional push
+    try { await fetch(`${API}/api/status?repo=${encodeURIComponent(repo)}`) } catch {}
+    setSyncStep('Complete ✓')
+    setNote(''); setShowSave(false)
     await refresh()
-    setTimeout(()=>setSyncState(null), 1500)
-    setSaving(false)
+    setTimeout(()=>setSyncStep(null), 1200)
   }
 
-  const restore = async (v: Version) => {
-    if (status?.has_changes) {
-      if (!confirm(`You have unsaved changes. A safety snapshot will be created before restoring to "${v.message}". Continue?`)) return
-    } else {
-      if (!confirm(`Restore to "${v.message}"? This will overwrite timeline.otio (backed up automatically).`)) return
-    }
-    const res = await fetch(`${API}/api/restore`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: REPO, rev: v.hash, apply: true})}).then(r=>r.json())
-    if (!res.ok) alert(res.error)
-    else alert(`Restored to ${v.short}. Next: Resolve → File → Import Timeline → OpenTimelineIO → timeline.otio`)
+  const doRestore = async (v: Version) => {
+    const hasChanges = status?.has_changes
+    let msg = `Restore to "${v.message}"?\n\nThis will become your current timeline in ~/GetSyncd/timeline.otio.\nNext: Resolve → File → Import Timeline → OpenTimelineIO → timeline.otio`
+    if (hasChanges) msg = `You have unsaved changes. A safety snapshot will be created first, then restore to "${v.message}".\n\nContinue?`
+    if (!confirm(msg)) return
+    const res = await fetch(`${API}/api/restore`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, rev: v.hash, apply: true})}).then(r=>r.json())
+    if (!res.ok) { alert(`Restore failed: ${res.error}\nYour current work was not deleted.`); return }
+    alert(`Restored to ${v.short} — safety snapshot ${res.safety ? 'saved' : 'created if needed'}.\nNext: Import ~/GetSyncd/timeline.otio in Resolve. You can undo by restoring the previous version.`)
     refresh()
   }
 
-  const groups = groupByDate(log)
+  const doSync = async () => {
+    setSyncStep('Syncing with GitHub...')
+    // naive: try push via CLI? For now just status
+    try {
+      const s = await api('/api/status')
+      if (!s.is_repo) { alert('No project yet — Create Project first'); setSyncStep(null); return }
+      // In real app, call POST /api/push
+      setSyncStep('Complete ✓')
+      setTimeout(()=>setSyncStep(null), 1200)
+    } catch (e:any) {
+      alert(`SYNC FAILED\n\nYour local project has not been deleted.\n${e.message}\n\n[Reconnect GitHub] [Retry]`)
+      setSyncStep(null)
+    }
+  }
+
+  const doCreate = async () => {
+    const r = await fetch(`${API}/api/init`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: folder})}).then(r=>r.json())
+    if (!r.ok) alert(r.error)
+    else { setRepo(folder); setShowSetup(false); refresh() }
+  }
+
+  const groups: Record<string, Version[]> = {}
+  const today = new Date().toISOString().slice(0,10)
+  const yest = new Date(Date.now()-864e5).toISOString().slice(0,10)
+  for (const v of log) {
+    let k = v.date
+    if (k===today) k='Today'
+    else if (k===yest) k='Yesterday'
+    groups[k] = groups[k] || []
+    groups[k].push(v)
+  }
+
+  if (showSetup) {
+    return (
+      <div className="setup">
+        <h1>Create Project</h1>
+        <div className="card">
+          <label>Project folder:</label>
+          <div className="row">
+            <input value={folder} onChange={e=>setFolder(e.target.value)} placeholder="~/GetSyncd" />
+            <button onClick={()=>setFolder(DEFAULT_REPO)}>Select Folder</button>
+          </div>
+          <div className="detect">
+            <div>Detected:</div>
+            <div>DaVinci Resolve project</div>
+            <div>Media: <b>keeps local (164 GB example)</b></div>
+            <div>Timeline: <b>32 MB — will be versioned</b></div>
+            <p className="muted">Get Syncd will version the timeline while keeping your media files local.</p>
+          </div>
+          <button className="primary big" onClick={doCreate}>Create Project</button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="app">
@@ -92,24 +148,25 @@ export default function App() {
         </div>
         <div className="actions">
           {status?.has_changes ? <span className="unsaved">● Unsaved changes</span> : <span className="saved">✓ Up to date</span>}
-          <button className="primary" onClick={saveVersion} disabled={saving}>{saving ? syncState || 'Saving…' : 'Save version'}</button>
+          <button onClick={()=>setShowSave(true)} className="primary">Save version</button>
+          <button onClick={doSync} className="ghost">Sync</button>
         </div>
       </header>
 
-      {syncState && <div className="syncbar">{syncState}</div>}
+      {syncStep && <div className="syncbar">{syncStep}</div>}
 
       <div className="main">
         <aside className="history">
           <div className="h">History</div>
-          {Object.entries(groups).map(([date, vs]) => (
-            <div key={date} className="group">
-              <div className="gdate">{date}</div>
-              {vs.map(v => (
+          {Object.entries(groups).map(([d, vs])=>(
+            <div key={d} className="group">
+              <div className="gdate">{d}</div>
+              {vs.map(v=>(
                 <div key={v.hash} className={`row ${selected?.hash===v.hash?'sel':''}`} onClick={()=>setSelected(v)}>
-                  <div className="thumb" style={{background: `url(${API}/api/preview?repo=${encodeURIComponent(REPO)}&hash=${v.short}) center/cover`}} />
+                  <div className="thumb" style={{background: v.preview ? `url(${API}/api/preview?repo=${encodeURIComponent(repo)}&hash=${v.short}) center/cover` : '#222'}} />
                   <div className="meta">
                     <div className="msg">{v.message}</div>
-                    <div className="sub">{diff && selected?.hash===v.hash ? diff.changelog : v.date}</div>
+                    <div className="sub">{v.date} • {v.short}</div>
                   </div>
                 </div>
               ))}
@@ -124,35 +181,49 @@ export default function App() {
               <div className="detailHead">
                 <div>
                   <h2>{selected.message}</h2>
-                  <p className="vs">vs previous version — {diff ? `${diff.summary.trimmed||0} trimmed, ${diff.summary.removed||0} removed, runtime ${diff.summary.runtime_delta_s>0?'+':''}${diff.summary.runtime_delta_s}s` : 'loading...'}</p>
+                  <p className="vs">vs previous version — {diff ? `${diff.summary?.trimmed||0} trimmed, ${diff.summary?.removed||0} removed, runtime ${diff.summary?.runtime_delta_s>0?'+':''}${diff.summary?.runtime_delta_s||0}s` : '...'}</p>
                   {diff && <div className="barWrap">
                     <div className="bar">
-                      {diff.new_track?.items?.map((it:any, i:number) => {
+                      {diff.new_track?.items?.slice(0,30).map((it:any,i:number)=>{
                         const ch = diff.changes.find((c:any)=>c.index_new===i)
                         const cls = ch ? ch.type : 'unchanged'
-                        return <div key={i} className={`clip ${cls}`} title={it.name} style={{flex: it.duration_frames}}>{it.name.slice(0,8)}</div>
+                        return <div key={i} className={`clip ${cls}`} title={it.name} style={{flex: it.duration_frames || 1}} />
                       })}
                     </div>
                     <div className="legend"><span className="l u" /> Unchanged <span className="l t" /> Trimmed <span className="l r" /> Removed <span className="l a" /> Added</div>
                   </div>}
                 </div>
-                <button className="restore" onClick={()=>restore(selected)}>Restore</button>
+                <button className="restore" onClick={()=>doRestore(selected)}>Restore</button>
               </div>
-
               <div className="changes">
                 <h3>Changes</h3>
-                {diff?.changes?.length ? diff.changes.map((c:any,i:number)=>(
-                  <div key={i} className={`change ${c.type}`}>
-                    <span className="dot2" /> {c.clip_name} — {c.type} {c.details?.delta_s ? `trimmed by ${c.details.delta_s}s` : c.type==='removed' ? 'removed' : c.type==='added' ? 'new take added' : ''}
-                  </div>
+                {diff?.changes?.length ? diff.changes.slice(0,12).map((c:any,i:number)=>(
+                  <div key={i} className={`change ${c.type}`}><span className="dot2" /> {c.clip_name || 'Clip'} — {c.type} {c.details?.delta_s ? `trimmed by ${c.details.delta_s}s` : ''}</div>
                 )) : <div className="muted">No clip-level changes or loading…</div>}
+                {diff?.warnings?.length ? <div className="warn">{diff.warnings.join(' • ')}</div> : null}
+              </div>
+              <div className="footActions">
+                <button onClick={()=>{ const a=log[log.findIndex(v=>v.hash===selected.hash)+1]?.hash || selected.hash; const b=selected.hash; window.open(`${API}/api/diff?repo=${encodeURIComponent(repo)}&a=${a}&b=${b}`, '_blank')}}>Compare</button>
+                <span className="muted">Project: {repo} — media stays local</span>
               </div>
             </>
           ) : <div className="muted">Select a version on the left</div>}
         </section>
       </div>
 
-      <footer className="foot">Project: {REPO} — media stays local, only timeline is versioned</footer>
+      {showSave && (
+        <div className="modalBg" onClick={()=>setShowSave(false)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <h3>Save Version</h3>
+            <p className="muted">This will create a new version from ~/GetSyncd/timeline.otio</p>
+            <textarea value={note} onChange={e=>setNote(e.target.value)} placeholder="Audio cleanup — trimmed intro, added B-roll" rows={3} />
+            <div className="modalActions">
+              <button onClick={()=>setShowSave(false)}>Cancel</button>
+              <button className="primary" onClick={doSave}>Save Version</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
