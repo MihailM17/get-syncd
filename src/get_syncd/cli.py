@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 import subprocess
@@ -148,8 +149,8 @@ def cmd_save(args):
                 auto_msg = "Initial version"
         except Exception:
             auto_msg = "Save version"
-        # interactive prompt (shows auto suggestion, Enter to accept)
-        if getattr(args, "no_prompt", False):
+        # interactive prompt (shows auto suggestion, Enter to accept) — json mode skips prompt
+        if getattr(args, "json", False) or getattr(args, "no_prompt", False):
             message = auto_msg
         else:
             message = ui.prompt_save_message(auto_msg, is_first=is_first)
@@ -169,6 +170,9 @@ def cmd_save(args):
             if head_check.returncode == 0:
                 diff_head = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", dest], cwd=str(repo), capture_output=True)
                 if diff_head.returncode == 0:
+                    if getattr(args, "json", False):
+                        print(json.dumps({"ok": False, "error": "No changes to save"}, indent=2))
+                        sys.exit(0)
                     ui.print_save_no_changes()
                     sys.exit(0)
         try:
@@ -192,17 +196,29 @@ def cmd_save(args):
             generate_preview(repo, commit_hash, repo / dest)
         except Exception:
             pass
-        ui.print_save_success(commit_hash[:8], message, repo, is_first=is_first)
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": True, "hash": commit_hash, "short": commit_hash[:8], "message": message, "repo": str(repo)}, indent=2))
+        else:
+            ui.print_save_success(commit_hash[:8], message, repo, is_first=is_first)
         return
 
     try:
         commit_hash = git_store.save_version(repo, source_path, message, timeline_dest=dest)
-        ui.print_save_success(commit_hash[:8], message, repo, is_first=is_first)
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": True, "hash": commit_hash, "short": commit_hash[:8], "message": message, "repo": str(repo)}, indent=2))
+        else:
+            ui.print_save_success(commit_hash[:8], message, repo, is_first=is_first)
     except ValueError as e:
         # no changes
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(0)
         ui.print_save_no_changes()
         sys.exit(0)
     except Exception as e:
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
         ui.print_error(f"Save failed: {e}")
         sys.exit(1)
 
@@ -210,12 +226,18 @@ def cmd_save(args):
 def cmd_status(args):
     repo = _get_repo(args)
     result = git_store.status(repo)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return
     ui.print_status(result, repo)
 
 
 def cmd_log(args):
     repo = _get_repo(args)
     versions = git_store.log_versions(repo, limit=args.limit)
+    if getattr(args, "json", False):
+        print(json.dumps(versions, indent=2))
+        return
     if args.verbose:
         ui.print_log_verbose(versions)
     else:
@@ -518,11 +540,13 @@ def build_parser():
     sp.add_argument("--file", "-f", help="Which .otio file to save (default: timeline.otio in this folder)")
     sp.add_argument("-m", "--message", help="Short note like \"Trimmed intro\" (auto-made if you skip it)")
     sp.add_argument("--no-prompt", action="store_true", help="Don't ask to edit the auto note (for scripts)")
+    sp.add_argument("--json", action="store_true", help="Machine-readable JSON output (for Tauri)")
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_save)
 
     # status
     sp = sub.add_parser("status", help="Check if you have unsaved edits")
+    sp.add_argument("--json", action="store_true", help="Machine-readable JSON output (for Tauri)")
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_status)
 
@@ -530,6 +554,7 @@ def build_parser():
     sp = sub.add_parser("log", help="See all saved versions")
     sp.add_argument("-n", "--limit", type=int, default=20, help="How many to show")
     sp.add_argument("-v", "--verbose", action="store_true", help="Show full hashes")
+    sp.add_argument("--json", action="store_true", help="Machine-readable JSON output (for Tauri)")
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_log)
 
@@ -584,6 +609,12 @@ def build_parser():
     sp.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_view)
+
+    # serve — local HTTP JSON API for Tauri
+    sp = sub.add_parser("serve", help="Start local JSON API for desktop app (Tauri sidecar)", description="Starts http://127.0.0.1:5174 with /api/status, /api/log, /api/diff, /api/save, /api/restore — React/Tauri fetches this.")
+    sp.add_argument("--port", type=int, default=5174, help="Port (default 5174)")
+    sp.add_argument("--open", action="store_true", help="Open health check in browser")
+    sp.set_defaults(func=lambda args: __import__("get_syncd.api_server", fromlist=["run_api_server"]).run_api_server(port=args.port, open_browser=args.open))
 
     # gui — sidecar desktop app
     sp = sub.add_parser("gui", help="Open sidecar desktop app (runs beside Resolve)", description="Sidecar window: Export from Resolve with one click, add note, save, see log/diff, change to any version, branches, watch. Keep open beside DaVinci Resolve.")

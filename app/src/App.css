@@ -1,0 +1,51 @@
+:root { --bg:#0a0a0a; --panel:#141414; --border:#262626; --text:#f5f5f5; --muted:#888; --orange:#ff6b35; --green:#2ecc71; --yellow:#f1c40f; --red:#e74c3c; --blue:#3498db }
+* { box-sizing: border-box }
+html,body,#root { height:100%; margin:0; background:var(--bg); color:var(--text); font-family: Inter, system-ui, -apple-system, sans-serif }
+.app { display:flex; flex-direction:column; height:100% }
+.top { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; border-bottom:1px solid var(--border); background:var(--bg) }
+.brand { display:flex; align-items:center; gap:12px; font-weight:700; font-size:18px }
+.logo { background:var(--orange); color:white; width:32px; height:32px; display:grid; place-items:center; border-radius:6px }
+.branch { background:var(--panel); border:1px solid var(--border); padding:6px 12px; border-radius:20px; font-size:13px; display:flex; gap:6px; align-items:center }
+.dot { width:8px; height:8px; background:#888; border-radius:50% }
+.actions { display:flex; align-items:center; gap:12px }
+.unsaved { color:#f59e0b; font-size:13px }
+.saved { color:var(--green); font-size:13px }
+.primary { background:white; color:black; border:0; padding:8px 16px; border-radius:8px; font-weight:600; cursor:pointer }
+.primary:disabled { opacity:0.6 }
+.syncbar { background:var(--panel); border-bottom:1px solid var(--border); padding:10px 18px; font-size:13px; color:var(--muted); text-align:center }
+.main { display:flex; flex:1; overflow:hidden }
+.history { width:360px; background:var(--panel); border-right:1px solid var(--border); overflow:auto; padding:14px }
+.h { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:12px }
+.group { margin-bottom:18px }
+.gdate { font-size:12px; color:var(--muted); margin:8px 0 8px 4px }
+.row { display:flex; gap:10px; padding:10px; border-radius:8px; cursor:pointer; align-items:center }
+.row.sel { background:#1f1f1f; border:1px solid var(--border) }
+.thumb { width:48px; height:32px; background:#222; border-radius:4px; flex-shrink:0; border:1px solid var(--border) }
+.meta { flex:1; min-width:0 }
+.msg { font-size:14px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+.sub { font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+.empty { color:var(--muted); font-size:13px; padding:20px; text-align:center }
+.detail { flex:1; padding:20px 24px; overflow:auto }
+.detailHead { display:flex; justify-content:space-between; gap:16px; margin-bottom:16px }
+.detailHead h2 { margin:0; font-size:22px }
+.vs { color:var(--muted); font-size:13px; margin:6px 0 12px }
+.barWrap { margin:12px 0 }
+.bar { display:flex; height:48px; background:#1a1a1a; border-radius:8px; overflow:hidden; border:1px solid var(--border); gap:2px; padding:4px }
+.clip { flex:1; border-radius:4px; display:grid; place-items:center; font-size:10px; color:white; min-width:40px }
+.clip.unchanged { background:#2a2a2a }
+.clip.trimmed { background:var(--yellow); color:black }
+.clip.removed { background:var(--red) }
+.clip.added { background:var(--green); color:black }
+.legend { display:flex; gap:12px; font-size:12px; color:var(--muted); margin-top:8px }
+.l { width:12px; height:12px; border-radius:2px; display:inline-block }
+.l.u { background:#2a2a2a } .l.t { background:var(--yellow) } .l.r { background:var(--red) } .l.a { background:var(--green) }
+.restore { background:var(--panel); border:1px solid var(--border); color:var(--text); padding:8px 16px; border-radius:8px; cursor:pointer; height:fit-content }
+.changes { border-top:1px solid var(--border); margin-top:20px; padding-top:16px }
+.changes h3 { margin:0 0 12px; font-size:14px; color:var(--muted) }
+.change { display:flex; gap:10px; padding:10px 0; border-bottom:1px solid var(--border); font-size:13px }
+.dot2 { width:8px; height:8px; border-radius:50%; margin-top:6px; flex-shrink:0 }
+.change.trimmed .dot2 { background:var(--yellow) }
+.change.removed .dot2 { background:var(--red) }
+.change.added .dot2 { background:var(--green) }
+.muted { color:var(--muted); padding:20px }
+.foot { padding:10px 18px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); background:var(--panel) }
