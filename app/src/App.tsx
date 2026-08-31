@@ -87,7 +87,7 @@ export default function App() {
     <div className="app">
       <header className="top">
         <div className="brand">
-          <span className="logo">◈</span> Reeltrace
+          <span className="logo">◈</span> Get Syncd
           <span className="branch"><span className="dot" /> {status?.current_branch || 'main'} ▾</span>
         </div>
         <div className="actions">
