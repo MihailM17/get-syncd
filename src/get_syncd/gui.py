@@ -150,8 +150,11 @@ class SidecarApp:
         except Exception:
             pass
         style = ttk.Style()
+        # keep native macOS theme (aqua) — clam makes tree white-on-white on some Macs
+        # only tweak Treeview row colors explicitly if needed
         try:
-            style.theme_use("clam")
+            style.configure("Treeview", background="white", foreground="black", fieldbackground="white")
+            style.configure("Treeview.Heading", background="#e5e5e5", foreground="black")
         except Exception:
             pass
 
@@ -345,22 +348,34 @@ class SidecarApp:
         self._preview_images.clear()
         try:
             versions = git_store.log_versions(self.repo, limit=50)
-            for i, v in enumerate(versions):
-                # ensure preview exists
-                p = _preview_path(self.repo, v["hash"])
-                if not p.exists():
-                    try:
-                        with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tmp:
-                            tp = Path(tmp.name)
-                        git_store.restore_version(self.repo, v["hash"], tp)
-                        generate_preview(self.repo, v["hash"], tp)
-                        tp.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                # thumb: show file existence indicator
-                thumb = "▬▬" if p.exists() else "…"
-                tag = "latest" if i == 0 else ""
-                self.tree.insert("", tk.END, values=(i+1, thumb, v["short"] + (" ← latest" if tag else ""), v["message"][:60], v["date"]))
+            if not versions:
+                self._set_diff_text("No saved versions yet.\n\n1) In Resolve: File → Export Timeline → OpenTimelineIO → save as ~/GetSyncd/timeline.otio (overwrite)\n2) Click Refresh if you just exported\n3) Type a note and click Save version\n→ It will appear here as a clickable row (#1 = newest).")
+                # also show in tree as placeholder
+                self.tree.insert("", tk.END, values=("", "—", "—", "No saved versions yet — Save one above", ""))
+            else:
+                for i, v in enumerate(versions):
+                    # ensure preview exists
+                    p = _preview_path(self.repo, v["hash"])
+                    if not p.exists() or p.stat().st_size < 100:
+                        try:
+                            with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tmp:
+                                tp = Path(tmp.name)
+                            git_store.restore_version(self.repo, v["hash"], tp)
+                            generate_preview(self.repo, v["hash"], tp)
+                            tp.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    # thumb: show file existence indicator
+                    thumb = "▬▬" if p.exists() and p.stat().st_size > 100 else "…"
+                    tag = "latest" if i == 0 else ""
+                    self.tree.insert("", tk.END, values=(i+1, thumb, v["short"] + (" ← latest" if tag else ""), v["message"][:60], v["date"]))
+                # auto-select latest for preview
+                if versions:
+                    first = self.tree.get_children()[0]
+                    if first:
+                        self.tree.selection_set(first)
+                        self.tree.focus(first)
+                        self.root.after(200, self._on_select)
         except Exception as e:
             self._set_diff_text(f"Log error: {e}")
 
