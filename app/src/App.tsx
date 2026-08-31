@@ -139,12 +139,22 @@ export default function App() {
     )
   }
 
+  const switchBranch = async () => {
+    const name = prompt(`Branches: ${(status?.branches||['main']).join(', ')}\n\nEnter existing branch to switch to, or new name to create:`, status?.current_branch || 'main')
+    if (!name) return
+    const trimmed = name.trim()
+    if (!trimmed) return
+    const r = await fetch(`${API}/api/branch`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, name: trimmed})}).then(r=>r.json())
+    if (!r.ok) { alert(r.error); return }
+    refresh()
+  }
+
   return (
     <div className="app">
       <header className="top">
         <div className="brand">
           <span className="logo">◈</span> Get Syncd
-          <span className="branch"><span className="dot" /> {status?.current_branch || 'main'} ▾</span>
+          <span className="branch" onClick={switchBranch} title="Click to switch or create branch" style={{cursor:'pointer'}}><span className="dot" /> {status?.current_branch || 'main'} ▾</span>
         </div>
         <div className="actions">
           {status?.has_changes ? <span className="unsaved">● Unsaved changes</span> : <span className="saved">✓ Up to date</span>}

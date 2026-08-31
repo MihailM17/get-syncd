@@ -246,8 +246,14 @@ def api_create_branch(repo: str | Path | None = None, name: str = "") -> dict:
     r = _resolve_repo(repo)
     if not name or not name.strip():
         return {"ok": False, "error": "Branch name required"}
+    name = name.strip()
+    # if branch exists, just switch; otherwise create
     try:
-        subprocess.run(["git", "checkout", "-b", name.strip()], cwd=str(r), check=True, capture_output=True, text=True)
-        return {"ok": True, "branch": name.strip(), "repo": str(r)}
+        existing = subprocess.run(["git", "branch", "--list", name], cwd=str(r), capture_output=True, text=True)
+        if existing.stdout.strip():
+            subprocess.run(["git", "checkout", name], cwd=str(r), check=True, capture_output=True, text=True)
+            return {"ok": True, "branch": name, "repo": str(r), "switched": True}
+        subprocess.run(["git", "checkout", "-b", name], cwd=str(r), check=True, capture_output=True, text=True)
+        return {"ok": True, "branch": name, "repo": str(r), "created": True}
     except subprocess.CalledProcessError as e:
         return {"ok": False, "error": e.stderr.strip() if e.stderr else str(e)}
