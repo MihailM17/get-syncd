@@ -271,7 +271,7 @@ class SidecarApp:
         # Diff text — white bg, black text (fix white-on-white)
         self.diff_text = tk.Text(right, height=14, wrap=tk.WORD, font=("Menlo", 11), bg="white", fg="black", bd=1, relief="solid", padx=8, pady=6, insertbackground="black")
         self.diff_text.pack(fill=tk.BOTH, expand=True)
-        self.diff_text.configure(state="disabled", disabledforeground="black")
+        self.diff_text.configure(state="disabled")
 
         # hint bar
         self.hint = ttk.Label(self.root, text="Keep this window beside Resolve. Export → type a note → Save. Pick any old version → Change to this version. Use Refresh if you exported manually to ~/GetSyncd/timeline.otio", foreground="#666", wraplength=1060, justify=tk.LEFT, font=("SF Pro Text", 10))
