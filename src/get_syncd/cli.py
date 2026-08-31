@@ -590,7 +590,12 @@ def build_parser():
     add_repo_arg(sp)
     def _cmd_gui(args):
         from pathlib import Path as _P
-        repo = _P(getattr(args, "repo", ".")).resolve()
+        repo_val = getattr(args, "repo", None)
+        if not repo_val:
+            from .gui import DEFAULT_WORKSPACE
+            repo = DEFAULT_WORKSPACE
+        else:
+            repo = _P(repo_val).resolve()
         from .gui import run_gui
         run_gui(repo)
     sp.set_defaults(func=_cmd_gui)
