@@ -8,6 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "Get Syncd Contributors" }]
 dependencies = [
     "opentimelineio>=0.17",
+    "rich>=13",
 ]
 
 [project.optional-dependencies]
