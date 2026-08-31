@@ -224,10 +224,10 @@ class SidecarApp:
         # history label
         ttk.Label(left, text="History — click any version to preview", font=("SF Pro Text", 11, "bold")).pack(anchor="w", pady=(0,4))
 
-        # Tree with preview thumb column (we fake thumb via text if PIL missing)
-        cols = ("#", "Preview", "Version", "What changed", "Date")
+        # Tree with preview thumb column — "#" is version number (1=latest, not file name)
+        cols = ("#", "Thumb", "ID", "Note", "Date")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", height=14)
-        widths = {"#": 36, "Preview": 86, "Version": 86, "What changed": 320, "Date": 86}
+        widths = {"#": 36, "Thumb": 56, "ID": 96, "Note": 320, "Date": 86}
         for c in cols:
             self.tree.heading(c, text=c)
             self.tree.column(c, width=widths[c], anchor="w")
@@ -250,9 +250,9 @@ class SidecarApp:
         tk.Button(tbtn, text="Push", command=self._push, bg="#f2f2f7", font=("SF Pro Text", 10), padx=10, pady=6, bd=0, relief="flat").pack(side=tk.RIGHT)
 
         # git tree visualiser (collapsible)
-        tree_box = ttk.LabelFrame(left, text="Git tree", padding=6)
+        tree_box = ttk.LabelFrame(left, text="Git tree — branches & history", padding=6)
         tree_box.pack(fill=tk.BOTH, expand=False, pady=(6,0))
-        self.git_text = tk.Text(tree_box, height=7, font=("Menlo", 10), wrap=tk.NONE, bg="#1c1c1e", fg="#e5e5e5", bd=0, padx=6, pady=4)
+        self.git_text = tk.Text(tree_box, height=7, font=("Menlo", 10), wrap=tk.NONE, bg="#1c1c1e", fg="#00ff7f", bd=0, padx=6, pady=4, insertbackground="white")
         self.git_text.pack(fill=tk.BOTH, expand=True)
         # horizontal scroll for graph
         gs = ttk.Scrollbar(tree_box, orient=tk.HORIZONTAL, command=self.git_text.xview)
@@ -264,15 +264,14 @@ class SidecarApp:
         paned.add(right, weight=3)
         ttk.Label(right, text="Preview + What changed", font=("SF Pro Text", 11, "bold")).pack(anchor="w", pady=(0,4))
 
-        # Preview image area
-        self.preview_lbl = tk.Label(right, text="Preview will appear here", bg="#1c1c1e", fg="#888", width=60, height=8, anchor="center", relief="flat")
+        # Preview image area — dark card, white text
+        self.preview_lbl = tk.Label(right, text="Preview will appear here\n(click a version on the left)", bg="#1c1c1e", fg="white", width=60, height=8, anchor="center", relief="flat", font=("SF Pro Text", 11))
         self.preview_lbl.pack(fill=tk.X, pady=(0,6))
 
-        # Diff text
-        self.diff_text = tk.Text(right, height=14, wrap=tk.WORD, font=("Menlo", 11), bg="#f2f2f7", bd=0, padx=8, pady=6)
+        # Diff text — white bg, black text (fix white-on-white)
+        self.diff_text = tk.Text(right, height=14, wrap=tk.WORD, font=("Menlo", 11), bg="white", fg="black", bd=1, relief="solid", padx=8, pady=6, insertbackground="black")
         self.diff_text.pack(fill=tk.BOTH, expand=True)
-        # make diff text read-only style
-        self.diff_text.configure(state="disabled")
+        self.diff_text.configure(state="disabled", disabledforeground="black")
 
         # hint bar
         self.hint = ttk.Label(self.root, text="Keep this window beside Resolve. Export → type a note → Save. Pick any old version → Change to this version. Use Refresh if you exported manually to ~/GetSyncd/timeline.otio", foreground="#666", wraplength=1060, justify=tk.LEFT, font=("SF Pro Text", 10))
