@@ -331,8 +331,10 @@ def print_dashboard(repo: Path, status_result: dict, versions: list[dict]):
         table.add_row("get-syncd status", "check if you have unsaved changes")
         table.add_row("get-syncd log", "see all saved versions")
         table.add_row("get-syncd diff 2 1", "see what changed between versions")
+        table.add_row("get-syncd restore 2 --apply", "change to that version (overwrites timeline.otio)")
+        table.add_row("get-syncd checkout 2", "same as restore --apply (one-click)")
+        table.add_row("get-syncd watch", "auto-detect Resolve exports")
         table.add_row("get-syncd view", "open visual timeline in browser")
-        table.add_row("get-syncd restore 1 --out /tmp/old.otio", "bring back an old version")
         console.print(table)
     else:
         print("Quick commands:")
@@ -340,6 +342,8 @@ def print_dashboard(repo: Path, status_result: dict, versions: list[dict]):
         print("  get-syncd status                       — check for unsaved changes")
         print("  get-syncd log                          — see all versions")
         print("  get-syncd diff 2 1                     — see what changed")
+        print("  get-syncd restore 2 --apply            — change to that version")
+        print("  get-syncd watch                        — watch for exports")
         print("  get-syncd view                         — visual timeline")
 
 # ---------- interactive prompt ----------
@@ -377,3 +381,83 @@ def print_hint(msg: str):
         console.print(f"[dim]{escape(msg)}[/]")
     else:
         print(msg)
+
+# ---------- restore --apply ----------
+def confirm_apply(rev: str, dest: Path) -> bool:
+    if not sys.stdin.isatty():
+        return True
+    prompt = f"Overwrite {dest} with version {rev}? This will become your current timeline. [y/N]: "
+    try:
+        if HAS_RICH:
+            console.print(f"[yellow]⚠ This will overwrite [bold]{escape(str(dest))}[/] with version [cyan]{escape(str(rev))}[/][/]")
+            console.print("[dim]Your current timeline.otio will be backed up to .get-syncd/backups/[/]")
+        ans = input(prompt).strip().lower()
+        return ans in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+def print_restore_apply_success(rev: str, dest: Path, repo: Path):
+    if HAS_RICH:
+        console.print(Panel(
+            f"[green bold]✓ Now using version {escape(str(rev))}[/]\n[bold]{escape(str(dest.resolve()))}[/] now contains that version.\n\n[bold]Next step:[/] In DaVinci Resolve, [cyan]File → Import Timeline → OpenTimelineIO[/] → pick [bold]timeline.otio[/] (or just re-import). Resolve will show the restored timeline.\n[dim]Tip: this overwrote timeline.otio directly — you can [cyan]get-syncd save -m \"keep restored\"[/] to save it as a new checkpoint, or just keep editing.[/]",
+            title="[green]Changed to this version![/]",
+            border_style="green",
+            box=box.ROUNDED,
+        ))
+    else:
+        print(f"\n✓ Now using version {rev}")
+        print(f"{dest} now contains that version.")
+        print("Next: In Resolve, File → Import Timeline → OpenTimelineIO → timeline.otio")
+
+def prompt_pick_version(versions: list[dict]) -> str:
+    # show short table then ask
+    print_log(versions[:10])
+    try:
+        if HAS_RICH:
+            console.print("[bold]Pick a version number to restore[/] [dim](1=latest, Enter to cancel):[/]")
+        else:
+            print("Pick a version number (1=latest): ")
+        val = input("> ").strip()
+        if not val:
+            return ""
+        if val.isdigit() and 1 <= int(val) <= len(versions):
+            return val
+        # also allow hash prefix
+        return val
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+# ---------- watch ----------
+def print_watch_start(repo: Path, interval: float, auto: bool):
+    mode = "auto-save" if auto else "prompt to save"
+    if HAS_RICH:
+        console.print(Panel(
+            f"[bold]Watching[/] [cyan]{escape(str(repo))}/timeline.otio[/]\n[dim]Poll every {interval}s — {mode}. Export from Resolve (File → Export Timeline → OpenTimelineIO → timeline.otio) and it will be detected.[/]\n[dim]Press Ctrl+C to stop.[/]",
+            title="[cyan]Watcher started[/]",
+            border_style="cyan",
+        ))
+    else:
+        print(f"Watching {repo}/timeline.otio every {interval}s ({mode}) — Ctrl+C to stop")
+
+def print_watch_change(d):
+    # reuse diff printing
+    print_diff_summary(d.summary, "HEAD", "current file", warnings=d.warnings)
+    print_diff_changes([c.to_dict() for c in d.changes], summary=d.summary)
+
+def prompt_watch_save() -> str:
+    # returns "save" / "diff" / "skip"
+    if not sys.stdin.isatty():
+        return "skip"
+    try:
+        if HAS_RICH:
+            console.print("[bold]Save this as a new version?[/] [dim][s]ave / [d]iff again / [Enter] skip:[/]")
+        else:
+            print("Save? [s]ave / [d]iff / skip (Enter): ", end="")
+        val = input("> " if not HAS_RICH else "").strip().lower()
+        if val in ("s", "save", "y", "yes"):
+            return "save"
+        if val in ("d", "diff"):
+            return "diff"
+        return "skip"
+    except (EOFError, KeyboardInterrupt):
+        return "skip"
