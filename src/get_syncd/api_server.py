@@ -55,7 +55,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/log":
             limit = int(qs.get("limit", ["20"])[0])
-            self._json(core_api.api_log(repo, limit=limit))
+            timeline = qs.get("timeline", [None])[0]
+            self._json(core_api.api_log(repo, limit=limit, timeline=timeline))
+            return
+        if parsed.path == "/api/timelines":
+            self._json(core_api.api_timelines(repo))
             return
         if parsed.path == "/api/graph":
             self._json(core_api.api_graph(repo))
@@ -63,11 +67,16 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/branches":
             self._json(core_api.api_branches(repo))
             return
+        if parsed.path == "/api/graph/viz":
+            timeline = qs.get("timeline", [None])[0]
+            self._json(core_api.api_graph_viz(repo, timeline=timeline))
+            return
         if parsed.path == "/api/diff":
             a = qs.get("a", ["HEAD~1"])[0]
             b = qs.get("b", ["HEAD"])[0]
+            timeline = qs.get("timeline", [None])[0]
             try:
-                data = core_api.api_diff(repo, a, b)
+                data = core_api.api_diff(repo, a, b, timeline=timeline)
                 self._json(data)
             except Exception as e:
                 self._json({"ok": False, "error": str(e)}, status=500)
@@ -109,11 +118,11 @@ class Handler(BaseHTTPRequestHandler):
         repo = data.get("repo") or urllib.parse.parse_qs(parsed.query).get("repo", [None])[0]
 
         if parsed.path == "/api/save":
-            res = core_api.api_save(repo, file=data.get("file"), message=data.get("message"))
+            res = core_api.api_save(repo, file=data.get("file"), message=data.get("message"), timeline=data.get("timeline"), all_timelines=bool(data.get("all_timelines")))
             self._json(res, status=200 if res.get("ok") else 400)
             return
         if parsed.path == "/api/restore":
-            res = core_api.api_restore(repo, rev=data.get("rev", "HEAD"), apply=bool(data.get("apply")), out=data.get("out"))
+            res = core_api.api_restore(repo, rev=data.get("rev", "HEAD"), apply=bool(data.get("apply")), out=data.get("out"), timeline=data.get("timeline"))
             self._json(res, status=200 if res.get("ok") else 400)
             return
         if parsed.path == "/api/init":
@@ -122,6 +131,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/branch":
             res = core_api.api_create_branch(repo, name=data.get("name", ""))
+            self._json(res, status=200 if res.get("ok") else 400)
+            return
+        if parsed.path == "/api/branch/delete":
+            res = core_api.api_delete_branch(repo, name=data.get("name", "") or data.get("branch", ""), force=bool(data.get("force")))
+            self._json(res, status=200 if res.get("ok") else 400)
+            return
+        if parsed.path == "/api/delete":
+            res = core_api.api_delete(repo, rev=data.get("rev") or data.get("hash") or "", timeline=data.get("timeline"))
+            self._json(res, status=200 if res.get("ok") else 400)
+            return
+        if parsed.path == "/api/export":
+            res = core_api.api_export(repo, out=data.get("out") or data.get("file"), timeline=data.get("timeline"))
             self._json(res, status=200 if res.get("ok") else 400)
             return
         if parsed.path == "/api/resolve/scan":

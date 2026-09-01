@@ -76,19 +76,34 @@ def _try_resolve_export(out_path: Path) -> tuple[bool, str]:
         if not timeline:
             return False, "No timeline open in Edit page."
         name = timeline.GetName() if hasattr(timeline, "GetName") else "timeline"
+        # Preferred: timeline.Export with OTIO constants (correct API)
+        try:
+            exp_otio = getattr(resolve, "EXPORT_OTIO", None)
+            exp_none = getattr(resolve, "EXPORT_NONE", None)
+            if exp_otio is not None and hasattr(timeline, "Export"):
+                ok = timeline.Export(str(out_path), exp_otio, exp_none if exp_none is not None else 0)
+                if ok:
+                    return True, f"Exported '{name}' → {out_path} via timeline.Export"
+        except Exception:
+            pass
         for meth in ["Export", "ExportTimeline", "ExportOTIO"]:
             if hasattr(timeline, meth):
                 try:
                     ok = getattr(timeline, meth)(str(out_path), "otio")
                     if ok:
-                        return True, f"Exported '{name}' → {out_path}"
+                        return True, f"Exported '{name}' → {out_path} via timeline.{meth}"
                 except Exception:
-                    continue
+                    try:
+                        ok = getattr(timeline, meth)(str(out_path))
+                        if ok:
+                            return True, f"Exported '{name}' → {out_path} via timeline.{meth}"
+                    except Exception:
+                        continue
         if hasattr(project, "ExportTimeline"):
             try:
                 ok = project.ExportTimeline(str(out_path), "otio")
                 if ok:
-                    return True, f"Exported '{name}' → {out_path}"
+                    return True, f"Exported '{name}' → {out_path} via project.ExportTimeline"
             except Exception:
                 pass
         return False, "Auto export not available in this Resolve version. Use File → Export Timeline → OpenTimelineIO → timeline.otio (manual fallback works)."
@@ -478,9 +493,15 @@ class SidecarApp:
         msg = self.msg_var.get().strip()
         src = self.repo / "timeline.otio"
         if not src.exists():
-            cands = list(self.repo.glob("*.otio"))
-            if cands:
-                src = cands[0]
+            cand = git_store.find_timeline_candidate(self.repo)
+            if cand and cand.exists():
+                src = cand
+                try:
+                    rel = cand.relative_to(self.repo)
+                    if str(rel) != "timeline.otio":
+                        print(f"[gui] Using discovered timeline: {rel}")
+                except Exception:
+                    pass
             else:
                 messagebox.showerror("No timeline", f"No {src} yet. Click Export or File → Export Timeline → OpenTimelineIO → {src}")
                 return

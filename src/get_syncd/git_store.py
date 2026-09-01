@@ -14,14 +14,34 @@ import os
 
 
 def _run_git(args: list[str], cwd: Path | str = ".", check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True, text=True, check=check)
+    # Use utf-8 explicitly — Resolve's Python API can switch locale to ascii (C), breaking git log with → arrow
+    return subprocess.run(
+        ["git"] + args, cwd=str(cwd), capture_output=True, text=True, encoding="utf-8", errors="replace", check=check
+    )
 
 
 def is_git_repo(path: Path | str = ".") -> bool:
-    try:
-        _run_git(["rev-parse", "--git-dir"], cwd=path)
+    p = Path(path)
+    # Check for direct .git in this folder (handles nested projects correctly)
+    if (p / ".git").exists():
         return True
-    except subprocess.CalledProcessError:
+    # Fallback: check if this exact path is a git repo (not just inside parent)
+    try:
+        r = _run_git(["rev-parse", "--git-dir"], cwd=p, check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            git_dir = r.stdout.strip()
+            # Resolve relative git dir
+            try:
+                gd = Path(git_dir)
+                if not gd.is_absolute():
+                    gd = (p / gd).resolve()
+                else:
+                    gd = gd.resolve()
+                return gd == (p / ".git").resolve()
+            except Exception:
+                return False
+        return False
+    except Exception:
         return False
 
 
@@ -39,6 +59,91 @@ def _ensure_git_identity(path: Path | str = ".") -> None:
         pass
 
 
+def find_timeline_candidate(repo_path: Path | str) -> Path | None:
+    """Safe discovery of an .otio file when timeline.otio is missing.
+
+    Priority: canonical timeline.otio > any .otio in root > recursive search.
+    Excludes internal .get-syncd/ and .git/ and hidden files.
+    Returns path or None. Does NOT pick snapshots.
+    """
+    repo = Path(repo_path)
+    # 1. canonical (case variants on macOS case-insensitive fs)
+    for name in ("timeline.otio", "Timeline.otio", "timeline.OTIO", "TIMELINE.OTIO"):
+        p = repo / name
+        if p.exists() and p.is_file():
+            return p
+    # 2. any .otio directly in repo root (non-recursive)
+    cands: list[Path] = []
+    for pat in ("*.otio", "*.OTIO"):
+        for p in repo.glob(pat):
+            if not p.is_file():
+                continue
+            if p.name.startswith("."):
+                continue
+            if ".get-syncd" in p.parts or ".git" in p.parts:
+                continue
+            # skip if inside a nested git repo (separate project)
+            try:
+                if (p.parent / ".git").exists():
+                    # root glob candidates shouldn't be inside nested repo anyway, but skip if so
+                    if p.parent.resolve() != repo.resolve():
+                        continue
+            except Exception:
+                pass
+            if p not in cands:
+                cands.append(p)
+    if cands:
+        # prefer timeline.otio case-insensitive, then shortest name, then alpha
+        cands.sort(key=lambda pp: (0 if pp.name.lower() == "timeline.otio" else 1, len(pp.name), pp.name.lower()))
+        return cands[0]
+    # 3. recursive search (e.g., Git test/timeline.otio) excluding internals
+    # Note: skips files inside nested git repos (they are separate projects)
+    all_otio: list[Path] = []
+    for pat in ("*.otio", "*.OTIO"):
+        for p in repo.rglob(pat):
+            if not p.is_file():
+                continue
+            if ".get-syncd" in p.parts or ".git" in p.parts:
+                continue
+            if p.name.startswith("."):
+                continue
+            # skip hidden dirs
+            try:
+                rel_parts = p.relative_to(repo).parts[:-1]
+            except Exception:
+                rel_parts = []
+            if any(part.startswith(".") for part in rel_parts):
+                continue
+            # skip if inside a nested git repo
+            try:
+                cur = p.parent
+                nested = False
+                while cur != repo and cur.is_relative_to(repo):
+                    if (cur / ".git").exists():
+                        nested = True
+                        break
+                    if cur.parent == cur:
+                        break
+                    cur = cur.parent
+                if nested:
+                    continue
+            except Exception:
+                pass
+            if p not in all_otio:
+                all_otio.append(p)
+    if not all_otio:
+        return None
+
+    def _sort_key(pp: Path):
+        rel = pp.relative_to(repo)
+        depth = len(rel.parts)
+        is_timeline = 0 if pp.name.lower() == "timeline.otio" else 1
+        return (depth, is_timeline, len(str(pp)), str(pp).lower())
+
+    all_otio.sort(key=_sort_key)
+    return all_otio[0]
+
+
 def init_repo(path: Path | str = ".", remote_url: Optional[str] = None) -> None:
     p = Path(path)
     if not is_git_repo(p):
@@ -47,9 +152,36 @@ def init_repo(path: Path | str = ".", remote_url: Optional[str] = None) -> None:
         # Ensure .gitignore
         gitignore = p / ".gitignore"
         if not gitignore.exists():
-            gitignore.write_text("# Get Syncd — ignore media, keep timeline\n*.mp4\n*.mov\n*.mxf\n*.wav\n*.aiff\n*.braw\n!timeline.otio\n")
+            gitignore.write_text("# Get Syncd — ignore media, keep timeline\n*.mp4\n*.mov\n*.mxf\n*.wav\n*.aiff\n*.braw\n!timeline.otio\n.get-syncd/\n.DS_Store\n")
+        else:
+            # ensure existing gitignore has .get-syncd and .DS_Store
+            try:
+                txt = gitignore.read_text()
+                need = []
+                if ".get-syncd" not in txt:
+                    need.append(".get-syncd/")
+                if ".DS_Store" not in txt:
+                    need.append(".DS_Store")
+                if need:
+                    gitignore.write_text(txt.rstrip() + "\n" + "\n".join(need) + "\n")
+            except Exception:
+                pass
     else:
         _ensure_git_identity(p)
+        # also patch existing gitignore if needed
+        try:
+            gi = p / ".gitignore"
+            if gi.exists():
+                txt = gi.read_text()
+                need = []
+                if ".get-syncd" not in txt:
+                    need.append(".get-syncd/")
+                if ".DS_Store" not in txt:
+                    need.append(".DS_Store")
+                if need:
+                    gi.write_text(txt.rstrip() + "\n" + "\n".join(need) + "\n")
+        except Exception:
+            pass
     if remote_url:
         try:
             _run_git(["remote", "add", "origin", remote_url], cwd=p)
@@ -165,9 +297,23 @@ def status(repo_path: Path | str = ".", timeline_file: str = "timeline.otio") ->
     if not is_git_repo(repo):
         return {"is_repo": False, "has_changes": None, "message": "Not a git repo — run get-syncd init"}
 
-    # Check if timeline file exists
+    # Check if timeline file exists — with safe fallback discovery
     tl = repo / timeline_file
     if not tl.exists():
+        cand = find_timeline_candidate(repo)
+        if cand and cand.exists() and cand != tl:
+            # Found an .otio elsewhere (e.g., Git test/timeline.otio) but canonical missing
+            try:
+                rel = cand.relative_to(repo)
+            except Exception:
+                rel = cand
+            return {
+                "is_repo": True,
+                "has_changes": True,
+                "message": f"Found {rel} but {timeline_file} is missing — will sync from there. Tip: move it to {timeline_file}",
+                "candidate": str(cand),
+                "stat": "",
+            }
         return {"is_repo": True, "has_changes": None, "message": f"No {timeline_file} yet — export from Resolve first"}
 
     # Compare working tree vs HEAD
@@ -255,6 +401,203 @@ def log_versions(repo_path: Path | str = ".", limit: int = 20, timeline_file: st
         return out
     except Exception:
         return []
+
+
+def delete_version(repo_path: Path | str, rev: str, timeline_file: str = "timeline.otio") -> dict:
+    """Delete a version (commit) from history.
+
+    Handles both HEAD and older commits via reset/rebase. Cleans up preview/snapshot.
+    Returns {"ok": True, "deleted": short, "new_head": short_or_None}
+    """
+    repo = Path(repo_path)
+    if not is_git_repo(repo):
+        raise ValueError("Not a git repo")
+    # Resolve rev to full hash
+    try:
+        r = _run_git(["rev-parse", rev], cwd=repo)
+        full = r.stdout.strip()
+        short = full[:8]
+    except subprocess.CalledProcessError as e:
+        raise ValueError(f"Version not found: {rev} ({e.stderr.strip() if e.stderr else e})")
+
+    # Check existence in log
+    versions = log_versions(repo, limit=100, timeline_file=timeline_file)
+    # Also check via git log all if not found in timeline-specific log (e.g., gitignore commits)
+    found = any(v["hash"] == full or v["hash"].startswith(rev) or rev.startswith(v["hash"][:8]) for v in versions)
+    if not found:
+        # Fallback: check if rev exists at all
+        try:
+            _run_git(["cat-file", "-e", full], cwd=repo)
+        except subprocess.CalledProcessError:
+            raise ValueError(f"Version not found: {rev}")
+
+    # Determine if rev is HEAD
+    try:
+        head = _run_git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    except subprocess.CalledProcessError:
+        head = ""
+
+    is_head = head and (head == full or head.startswith(rev) or rev.startswith(head[:8]))
+
+    # Count commits
+    try:
+        cnt_r = _run_git(["rev-list", "--count", "HEAD"], cwd=repo, check=False)
+        cnt = int(cnt_r.stdout.strip()) if cnt_r.returncode == 0 and cnt_r.stdout.strip().isdigit() else 0
+    except Exception:
+        cnt = 0
+
+    if is_head:
+        if cnt <= 1:
+            # Only one commit — delete HEAD
+            try:
+                _run_git(["update-ref", "-d", "HEAD"], cwd=repo)
+                # Remove timeline file from index if present
+                _run_git(["rm", "--cached", timeline_file], cwd=repo, check=False)
+                # Keep working file? Remove it to reflect no versions
+                # Don't delete working file automatically — leave it for user
+            except Exception as e:
+                raise ValueError(f"Failed to delete initial version: {e}")
+            # Clean up snapshot/preview
+            try:
+                (repo / ".get-syncd" / "snapshots" / f"{short}.otio").unlink(missing_ok=True)
+                (repo / ".get-syncd" / "previews" / f"{short}.png").unlink(missing_ok=True)
+            except Exception:
+                pass
+            return {"ok": True, "deleted": short, "new_head": None}
+        else:
+            # Reset HEAD to parent
+            try:
+                _run_git(["reset", "--hard", "HEAD~1"], cwd=repo)
+            except subprocess.CalledProcessError as e:
+                raise ValueError(f"Failed to delete {short}: {e.stderr.strip() if e.stderr else e}")
+            # Clean up
+            try:
+                (repo / ".get-syncd" / "snapshots" / f"{short}.otio").unlink(missing_ok=True)
+                (repo / ".get-syncd" / "previews" / f"{short}.png").unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                new_head = _run_git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()[:8]
+            except Exception:
+                new_head = None
+            return {"ok": True, "deleted": short, "new_head": new_head}
+    else:
+        # Not HEAD — use rebase to drop the commit
+        # Find parent
+        try:
+            parent_r = _run_git(["rev-parse", f"{full}^"], cwd=repo)
+            parent = parent_r.stdout.strip()
+        except subprocess.CalledProcessError:
+            # Root commit — replay later commits onto empty orphan branch
+            try:
+                # Get commits after root in reverse order (root .. HEAD)
+                commits_r = _run_git(["rev-list", "--reverse", "HEAD"], cwd=repo)
+                all_commits = [c.strip() for c in commits_r.stdout.strip().split("\n") if c.strip()]
+                # all_commits[0] should be root (full)
+                try:
+                    root_idx = all_commits.index(full)
+                except ValueError:
+                    # Find by short
+                    root_idx = next((i for i, c in enumerate(all_commits) if c.startswith(short) or short.startswith(c[:8])), -1)
+                    if root_idx == -1:
+                        raise ValueError("Root commit not found in history")
+                later = all_commits[root_idx+1:]
+                if not later:
+                    # Only root existed — already handled as single commit case, but fallback
+                    _run_git(["update-ref", "-d", "HEAD"], cwd=repo, check=False)
+                    _run_git(["rm", "--cached", timeline_file], cwd=repo, check=False)
+                else:
+                    # Create orphan branch and replay each later commit's timeline content
+                    # Save current branch name
+                    try:
+                        cur_branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo).stdout.strip()
+                    except Exception:
+                        cur_branch = "main"
+                    if cur_branch == "HEAD":
+                        cur_branch = "main"
+                    # Create temp orphan
+                    _run_git(["checkout", "--orphan", "temp-replay-root"], cwd=repo, check=False)
+                    _run_git(["rm", "-rf", "."], cwd=repo, check=False)
+                    # Remove all files from index
+                    _run_git(["clean", "-fd"], cwd=repo, check=False)
+                    for c in later:
+                        # Get commit message and author
+                        msg_r = _run_git(["log", "-1", "--pretty=%B", c], cwd=repo, check=False)
+                        msg = msg_r.stdout.strip() if msg_r.returncode == 0 else f"Replay {c[:8]}"
+                        # Get timeline content at that commit
+                        show_r = _run_git(["show", f"{c}:{timeline_file}"], cwd=repo, check=False)
+                        if show_r.returncode == 0:
+                            Path(repo / timeline_file).write_text(show_r.stdout, encoding="utf-8")
+                            _run_git(["add", timeline_file], cwd=repo, check=False)
+                        else:
+                            # If file not in that commit, skip
+                            pass
+                        # Also add .gitignore if exists in that commit
+                        gi_r = _run_git(["show", f"{c}:.gitignore"], cwd=repo, check=False)
+                        if gi_r.returncode == 0:
+                            Path(repo / ".gitignore").write_text(gi_r.stdout, encoding="utf-8")
+                            _run_git(["add", ".gitignore"], cwd=repo, check=False)
+                        # Commit with original message
+                        _run_git(["commit", "-m", msg], cwd=repo, check=False)
+                    # Delete old branch and rename
+                    _run_git(["branch", "-D", cur_branch], cwd=repo, check=False)
+                    _run_git(["branch", "-m", cur_branch], cwd=repo, check=False)
+            except subprocess.CalledProcessError as e:
+                try:
+                    _run_git(["rebase", "--abort"], cwd=repo, check=False)
+                    _run_git(["checkout", cur_branch if 'cur_branch' in locals() else "main"], cwd=repo, check=False)
+                except Exception:
+                    pass
+                raise ValueError(f"Failed to delete root version {short}: {e.stderr.strip() if e.stderr else str(e)}")
+            except Exception as e:
+                raise ValueError(f"Failed to delete root version {short}: {e}")
+            # Clean up
+            try:
+                (repo / ".get-syncd" / "snapshots" / f"{short}.otio").unlink(missing_ok=True)
+                (repo / ".get-syncd" / "previews" / f"{short}.png").unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                new_head = _run_git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()[:8]
+            except Exception:
+                new_head = None
+            return {"ok": True, "deleted": short, "new_head": new_head}
+
+        # Normal non-head, non-root: rebase --onto parent rev HEAD
+        try:
+            # Use --no-verify to avoid hooks, and set GIT_SEQUENCE_EDITOR to true to avoid interactive
+            env = os.environ.copy()
+            env["GIT_SEQUENCE_EDITOR"] = "true"
+            # Use rebase --onto
+            subprocess.run(
+                ["git", "rebase", "--onto", parent, full, "HEAD"],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            # Try to abort rebase on failure
+            try:
+                _run_git(["rebase", "--abort"], cwd=repo, check=False)
+            except Exception:
+                pass
+            raise ValueError(f"Failed to delete {short}: {e.stderr.strip() if e.stderr else str(e)}")
+
+        # Clean up snapshot/preview for deleted hash
+        try:
+            (repo / ".get-syncd" / "snapshots" / f"{short}.otio").unlink(missing_ok=True)
+            (repo / ".get-syncd" / "previews" / f"{short}.png").unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            new_head = _run_git(["rev-parse", "HEAD"], cwd=repo).stdout.strip()[:8]
+        except Exception:
+            new_head = None
+        return {"ok": True, "deleted": short, "new_head": new_head}
 
 
 def file_hash(path: Path | str) -> str:

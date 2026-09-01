@@ -84,31 +84,25 @@ def cmd_init(args):
 def cmd_save(args):
     repo = _get_repo(args)
     source = args.file
-    # nice discovery if no --file
+    # nice discovery if no --file — uses safe helper that excludes .get-syncd
     if source is None:
-        default = repo / "timeline.otio"
-        # also look for any .otio in repo
-        if default.exists():
-            source = str(default)
+        cand = git_store.find_timeline_candidate(repo)
+        if cand and cand.exists():
+            source = str(cand)
+            try:
+                rel = cand.relative_to(repo)
+                if str(rel) != "timeline.otio":
+                    ui.print_hint(f"Using {rel} (canonical is timeline.otio — will copy to timeline.otio on save).")
+                elif cand.name != "timeline.otio":
+                    ui.print_hint(f"Using {cand.name} (no --file given).")
+            except Exception:
+                ui.print_hint(f"Using {cand.name} (no --file given).")
         else:
-            # look for any otio file in repo
-            cands = list(repo.glob("*.otio"))
-            if cands:
-                if len(cands) == 1:
-                    source = str(cands[0])
-                    ui.print_hint(f"Using {cands[0].name} (no --file given).")
-                else:
-                    ui.print_error(
-                        "Multiple .otio files found — which one to save?",
-                        hint=f"Found: {', '.join(p.name for p in cands)}\nRun: get-syncd save --file <name>.otio -m \"your note\"",
-                    )
-                    sys.exit(1)
-            else:
-                ui.print_error(
-                    "No timeline file found.",
-                    hint="In Resolve: File → Export Timeline → OpenTimelineIO → save as timeline.otio in this folder, then run get-syncd save",
-                )
-                sys.exit(1)
+            ui.print_error(
+                "No timeline file found.",
+                hint="In Resolve: File → Export Timeline → OpenTimelineIO → save as timeline.otio in this folder, then run get-syncd save",
+            )
+            sys.exit(1)
 
     source_path = Path(source)
     if not source_path.exists():
@@ -481,6 +475,36 @@ def cmd_push(args):
         sys.exit(1)
 
 
+def cmd_delete(args):
+    repo = _get_repo(args)
+    rev_input = getattr(args, "rev", None)
+    if not rev_input:
+        versions = git_store.log_versions(repo, limit=20)
+        if not versions:
+            ui.print_error("No versions to delete.", hint="Save one first.")
+            sys.exit(1)
+        rev_input = ui.prompt_pick_version(versions)
+        if not rev_input:
+            sys.exit(0)
+    rev = _resolve_rev_alias(repo, rev_input)
+    # Confirm unless --yes
+    if not getattr(args, "yes", False) and sys.stdin.isatty():
+        versions = git_store.log_versions(repo, limit=50)
+        msg = next((v["message"] for v in versions if v["hash"] == rev or v["short"] == rev_input or rev_input in v["hash"]), rev_input)
+        if not ui.confirm_delete(rev_input, msg):
+            print("Cancelled.")
+            sys.exit(0)
+    try:
+        res = git_store.delete_version(repo, rev)
+        if ui.HAS_RICH:
+            ui.console.print(f"[green]Deleted {res['deleted']}[/] — new HEAD {res.get('new_head') or '(no versions left)'}")
+        else:
+            print(f"Deleted {res['deleted']} — new HEAD {res.get('new_head')}")
+    except Exception as e:
+        ui.print_error(f"Delete failed: {e}", hint="Try 'get-syncd log' to see valid versions.")
+        sys.exit(1)
+
+
 def cmd_view(args):
     repo = _get_repo(args)
     try:
@@ -609,6 +633,19 @@ def build_parser():
     sp.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_view)
+
+    # delete
+    sp = sub.add_parser("delete", help="Delete a version from history", description="Permanently removes a version (git rebase/reset). Later versions are rewritten. Use with care.")
+    sp.add_argument("rev", nargs="?", help="Version to delete: number (1=latest), hash, or HEAD~1 (omit for interactive picker)")
+    sp.add_argument("--yes", action="store_true", help="Skip confirmation")
+    add_repo_arg(sp)
+    sp.set_defaults(func=cmd_delete)
+    for _alias in ("rm", "remove", "trash"):
+        sp = sub.add_parser(_alias, help="Delete a version (alias for delete)")
+        sp.add_argument("rev", nargs="?", help="Version to delete")
+        sp.add_argument("--yes", action="store_true", help="Skip confirmation")
+        add_repo_arg(sp)
+        sp.set_defaults(func=cmd_delete)
 
     # serve — local HTTP JSON API for Tauri
     sp = sub.add_parser("serve", help="Start local JSON API for desktop app (Tauri sidecar)", description="Starts http://127.0.0.1:5174 with /api/status, /api/log, /api/diff, /api/save, /api/restore — React/Tauri fetches this.")

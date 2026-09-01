@@ -396,6 +396,20 @@ def confirm_apply(rev: str, dest: Path) -> bool:
     except (EOFError, KeyboardInterrupt):
         return False
 
+
+def confirm_delete(rev: str, msg: str) -> bool:
+    if not sys.stdin.isatty():
+        return True
+    prompt = f"Delete version {rev} ({msg})? This rewrites history and cannot be undone without a backup. [y/N]: "
+    try:
+        if HAS_RICH:
+            console.print(f"[red]⚠ Delete version [bold]{escape(str(rev))}[/] — [dim]{escape(msg)}[/]?[/]")
+            console.print("[dim]This will permanently remove that version from history (git rebase/reset). Later versions will be rewritten.[/]")
+        ans = input(prompt).strip().lower()
+        return ans in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
 def print_restore_apply_success(rev: str, dest: Path, repo: Path):
     if HAS_RICH:
         console.print(Panel(
