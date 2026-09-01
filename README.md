@@ -1,18 +1,40 @@
 # Get Syncd
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-lightgrey.svg)](https://developer.apple.com/macos/)
+[![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-18.5%2B-orange.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
+
 Version control for DaVinci Resolve timelines. No more `MyFilm_v3_FINAL_FINAL.drp`.
 
 You export your timeline as OTIO, hit save, and you can see what actually changed between any two versions — "trimmed 2 clips, added 1, runtime +1.2s" — then jump back to any old cut without digging through old project files.
 
-Media stays on your drive. Only the timeline structure (clip order, trims, gaps) goes into git, so it’s tiny and works fine on the free GitHub plan. Works with Resolve Free — you don’t need Studio.
+Media stays on your drive. Only the timeline structure (clip order, trims, gaps) goes into git, so it's tiny and works fine on the free GitHub plan. Works with Resolve Free — you don't need Studio.
 
-There’s a CLI if you like the terminal, and a desktop app if you don’t.
+There's a CLI if you like the terminal, and a desktop app if you don't.
+
+### See it in action
+
+![Get Syncd GUI](assets/getsyncd-gui-example.png)
+
+*The sidecar app: history on the left with timeline-bar thumbnails, preview + plain-English diff on the right. Click any version to see what changed vs latest.*
+
+### Traditional workflow vs Get Syncd
+
+| Aspect | Traditional (`MyFilm_v4_FINAL.drp`) | Get Syncd |
+|--------|-------------------------------------|-----------|
+| **History** | Manual file copies, cryptic names | `get-syncd log` — one-line summaries |
+| **Compare** | Open two .drp files, eyeball | `get-syncd diff HEAD~1 HEAD` — "3 trimmed, 1 added, runtime +1.2s" |
+| **Restore** | Hunt for right .drp, re-import | `get-syncd restore HEAD~3` → Import OTIO |
+| **Storage** | Full project files (GBs) | OTIO text (~KBs), fits free GitHub |
+| **Branching** | Duplicate folders | `get-syncd branch experiment` — instant |
+| **Collaboration** | WeTransfer .drp files | `git push` / PRs on GitHub |
 
 ### How it works
 
 `Resolve` → `File → Export Timeline → OpenTimelineIO` → `timeline.otio` → `get-syncd save` → git commit → (optional) push to GitHub.
 
-Restoring just writes an `.otio` you re-import in Resolve. That part is manual — the Resolve API can’t reliably lay out clips for you, so `Import Timeline` is still the safest way.
+Restoring just writes an `.otio` you re-import in Resolve. That part is manual — the Resolve API can't reliably lay out clips for you, so `Import Timeline` is still the safest way.
 
 ### Quick start
 
@@ -56,14 +78,14 @@ The app watches `~/GetSyncd` by default. Export from Resolve to `timeline.otio` 
 
 ### Why OTIO + git?
 
-- `.drp` files are binary blobs — git can’t diff them in a useful way.
+- `.drp` files are binary blobs — git can't diff them in a useful way.
 - OTIO is JSON describing your timeline. Git diffs that fine, and `get-syncd` turns it into plain English.
-- You don’t need to learn git. `save` / `log` / `diff` / `restore` is the whole surface.
+- You don't need to learn git. `save` / `log` / `diff` / `restore` is the whole surface.
 
 ### Notes
 
 - Tested on macOS Apple Silicon, Resolve 18.5+ Free. Linux works for the CLI/diff engine without Resolve.
-- Media paths are absolute — if you move drives, relink in Resolve’s Media Pool like you normally would.
+- Media paths are absolute — if you move drives, relink in Resolve's Media Pool like you normally would.
 - `get-syncd push` is just `git push` to whatever GitHub repo you linked with `get-syncd init --remote` or `git remote add origin ...`.
 
 MIT — do what you want with it. Issues and small PRs welcome.
