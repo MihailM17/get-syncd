@@ -66,7 +66,7 @@ def _load_known_timelines(repo: Path) -> tuple[str | None, list[str]]:
 
 def _get_resolve_timelines(repo: Path | None = None) -> tuple[str | None, list[str]]:
     """Return (current_timeline_name, all_timeline_names) from Resolve, or cached if not running. Remembers all seen."""
-    # Try live Resolve first
+    # Try live Resolve first — repo-aware: try to find project for this repo
     try:
         for pp in [
             "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
@@ -78,7 +78,34 @@ def _get_resolve_timelines(repo: Path | None = None) -> tuple[str | None, list[s
         resolve = bmd.scriptapp("Resolve")
         if resolve:
             pm = resolve.GetProjectManager()
-            project = pm.GetCurrentProject() if pm else None
+            # Try to find project for this repo (by folder name) first
+            target_project = None
+            if repo:
+                try:
+                    # Folder name like "Marginal Videos" should match Resolve project name
+                    repo_name = Path(repo).name
+                    # Try to get project list and find matching
+                    for folder_arg in ["Root", "", None]:
+                        try:
+                            meth = getattr(pm, "GetProjectListInFolder", None)
+                            if meth and callable(meth):
+                                plist = meth(folder_arg) if folder_arg is not None else meth()
+                                if plist and repo_name in plist:
+                                    # Found it — try to load it without switching current
+                                    # We can get its timeline count via LoadProject? But that would switch current, so avoid
+                                    # Instead, just use current project if its name matches repo_name
+                                    cur_proj = pm.GetCurrentProject()
+                                    if cur_proj and cur_proj.GetName() == repo_name:
+                                        target_project = cur_proj
+                                    break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            # Fallback to current project
+            if not target_project:
+                target_project = pm.GetCurrentProject() if pm else None
+            project = target_project
             if project:
                 current = None
                 try:
@@ -99,15 +126,18 @@ def _get_resolve_timelines(repo: Path | None = None) -> tuple[str | None, list[s
                 if not all_names and current:
                     all_names = [current]
                 if all_names:
-                    # Persist for when Resolve is closed
-                    if repo:
-                        _save_known_timelines(repo, current, all_names)
+                    # Persist for when Resolve is closed — use the project that we actually queried
+                    save_repo = repo
+                    # If we used current project but repo was for a different project, save to that repo's cache
+                    # For now, save to the requested repo if given, otherwise default
+                    if save_repo:
+                        _save_known_timelines(save_repo, current, all_names)
                     else:
-                        # Try to save for default repo
                         try:
                             _save_known_timelines(DEFAULT_REPO, current, all_names)
                         except Exception:
                             pass
+                    # Also update current for the repo's project if needed
                     return current, all_names
     except Exception:
         pass
@@ -261,8 +291,8 @@ def api_status(repo: str | Path | None = None) -> dict:
         except Exception:
             pass
     combined_names = list(dict.fromkeys(all_names + fs_names))
-        if not combined_names and files:
-            combined_names = [f.stem if f.name != "timeline.otio" else "timeline" for f in files]
+    if not combined_names and files:
+        combined_names = [f.stem if f.name != "timeline.otio" else "timeline" for f in files]
     for name in combined_names:
         tf = _get_timeline_file(r, name if name != "timeline" else None)
         # For legacy, use git_store.status with specific file
