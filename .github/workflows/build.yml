@@ -38,7 +38,12 @@ jobs:
 
   desktop:
     needs: python-tests
+    # Release uploads need write access; without this, tag builds fail while
+    # plain build-only runs succeed.
+    permissions:
+      contents: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -56,6 +61,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: app/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -83,15 +93,19 @@ jobs:
       # Version tags (v*) build AND publish: the .dmg/.exe/.msi/.AppImage get
       # attached to a GitHub Release — Releases are the main download.
       # Plain pushes/PRs only validate the build (no release).
-      - uses: tauri-apps/tauri-action@v0
+      # projectPath: the Tauri project lives in app/, not the repo root.
+      - uses: tauri-apps/tauri-action@v1
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          projectPath: app
           tagName: ${{ github.ref_name }}
           releaseName: Get Syncd ${{ github.ref_name }}
           releaseDraft: false
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: app
