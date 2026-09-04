@@ -15,145 +15,73 @@ from . import git_store
 from .otio_parse import parse_otio_file
 from .diff import diff_timelines, changelog_line
 from .preview import generate_preview, _preview_path
+from .resolve_state import (
+    DEFAULT_REPO,
+    _CURRENT_RESOLVE_CACHE,
+    _get_resolve_timelines,
+    _load_known_timelines,
+    _read_current_resolve_state,
+    _save_known_timelines,
+    _known_timelines_file,
+)
+from .timeline_files import _sanitize_timeline_name, _list_timeline_files
+import logging
 
-DEFAULT_REPO = Path.home() / "GetSyncd"
+log = logging.getLogger(__name__)
 
-def _sanitize_timeline_name(name: str) -> str:
-    name = (name or "").strip()
-    if not name:
-        return "Untitled"
-    safe = "".join(c if c.isalnum() or c in " -_." else "_" for c in name).strip()
-    if not safe:
-        safe = "timeline"
-    return safe
+# Backward-compatible re-exports (api.* callers keep working)
+__all__ = ["DEFAULT_REPO"]
 
-def _known_timelines_file(repo: Path) -> Path:
-    return repo / ".get-syncd" / "timelines.json"
 
-def _save_known_timelines(repo: Path, current: str | None, all_names: list[str]):
+def is_repo_allowed(repo: str | Path | None) -> bool:
+    """Trust boundary: only ~/GetSyncd and its subfolders are servable."""
     try:
-        repo = Path(repo)
-        f = _known_timelines_file(repo)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        # Merge with existing
-        existing = {"all_names": [], "current": None}
-        if f.exists():
-            try:
-                import json as _js
-                existing = _js.load(open(f, encoding="utf-8"))
-            except Exception:
-                pass
-        # Merge: keep all unique names
-        merged = list(dict.fromkeys((existing.get("all_names") or []) + all_names))
-        # Also add current if not in list
-        if current and current not in merged:
-            merged.append(current)
-        import json as _js
-        _js.dump({"current": current, "all_names": merged, "updated": __import__("datetime").datetime.now().isoformat()}, open(f, "w", encoding="utf-8"), indent=2)
+        if not repo:
+            return True  # resolves to DEFAULT_REPO itself
+        base = DEFAULT_REPO.resolve()
+        p = Path(repo).expanduser().resolve()
+        return p == base or base in p.parents
     except Exception:
-        pass
+        return False
 
-def _load_known_timelines(repo: Path) -> tuple[str | None, list[str]]:
-    try:
-        f = _known_timelines_file(repo)
-        if f.exists():
-            import json as _js
-            d = _js.load(open(f, encoding="utf-8"))
-            return d.get("current"), d.get("all_names") or []
-    except Exception:
-        pass
-    return None, []
 
-def _get_resolve_timelines(repo: Path | None = None) -> tuple[str | None, list[str]]:
-    """Return (current_timeline_name, all_timeline_names) from Resolve, or cached if not running. Remembers all seen."""
-    # Try live Resolve first — repo-aware: try to find project for this repo
+def api_get_current_resolve() -> dict:
+    """Read-only current Resolve project info for UI hints. Never switches projects."""
     try:
-        for pp in [
-            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
-            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
-        ]:
-            if pp not in __import__("sys").path and Path(pp).exists():
-                __import__("sys").path.append(pp)
-        import DaVinciResolveScript as bmd  # type: ignore
-        resolve = bmd.scriptapp("Resolve")
-        if resolve:
-            pm = resolve.GetProjectManager()
-            # Try to find project for this repo (by folder name) first
-            target_project = None
-            if repo:
-                try:
-                    # Folder name like "Marginal Videos" should match Resolve project name
-                    repo_name = Path(repo).name
-                    # Try to get project list and find matching
-                    for folder_arg in ["Root", "", None]:
-                        try:
-                            meth = getattr(pm, "GetProjectListInFolder", None)
-                            if meth and callable(meth):
-                                plist = meth(folder_arg) if folder_arg is not None else meth()
-                                if plist and repo_name in plist:
-                                    # Found it — try to load it without switching current
-                                    # We can get its timeline count via LoadProject? But that would switch current, so avoid
-                                    # Instead, just use current project if its name matches repo_name
-                                    cur_proj = pm.GetCurrentProject()
-                                    if cur_proj and cur_proj.GetName() == repo_name:
-                                        target_project = cur_proj
-                                    break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-            # Fallback to current project
-            if not target_project:
-                target_project = pm.GetCurrentProject() if pm else None
-            project = target_project
-            if project:
-                current = None
-                try:
-                    tl = project.GetCurrentTimeline()
-                    if tl and hasattr(tl, "GetName"):
-                        current = tl.GetName()
-                except Exception:
-                    pass
-                all_names: list[str] = []
-                try:
-                    n = project.GetTimelineCount()
-                    for i in range(1, int(n) + 1):
-                        tl = project.GetTimelineByIndex(i)
-                        if tl and hasattr(tl, "GetName"):
-                            all_names.append(tl.GetName())
-                except Exception:
-                    pass
-                if not all_names and current:
-                    all_names = [current]
-                if all_names:
-                    # Persist for when Resolve is closed — use the project that we actually queried
-                    save_repo = repo
-                    # If we used current project but repo was for a different project, save to that repo's cache
-                    # For now, save to the requested repo if given, otherwise default
-                    if save_repo:
-                        _save_known_timelines(save_repo, current, all_names)
-                    else:
-                        try:
-                            _save_known_timelines(DEFAULT_REPO, current, all_names)
-                        except Exception:
-                            pass
-                    # Also update current for the repo's project if needed
-                    return current, all_names
-    except Exception:
-        pass
-    # Fallback to cached
-    if repo:
-        cur, names = _load_known_timelines(repo)
-        if names:
-            return cur, names
-    # Fallback to default repo cache
+        project_name, current, all_names = _read_current_resolve_state()
+        return {"ok": True, "project": project_name, "current_timeline": current, "timelines": all_names}
+    except Exception as e:
+        log.warning("api_get_current_resolve failed: %s", e)
+        return {"ok": False, "error": str(e), "project": None, "current_timeline": None, "timelines": []}
+
+
+def api_sync_resolve(repo: str | Path | None = None) -> dict:
+    """Explicit user action: snapshot the currently open Resolve project into repo's cache.
+
+    Only writes when the open Resolve project name matches the repo folder name,
+    preventing cross-project pollution. Call from a 'Sync from Resolve' button,
+    never from background polling.
+    """
     try:
-        cur, names = _load_known_timelines(DEFAULT_REPO)
-        if names:
-            return cur, names
-    except Exception:
-        pass
-    return None, []
+        r = _resolve_repo(repo)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if not is_repo_allowed(r):
+        return {"ok": False, "error": "Repo outside ~/GetSyncd not allowed"}
+    # Bypass TTL — user explicitly asked for fresh state
+    _CURRENT_RESOLVE_CACHE["t"] = 0.0
+    project_name, current, all_names = _read_current_resolve_state()
+    if not project_name or not all_names:
+        return {"ok": False, "error": "No project open in Resolve — open a project first", "repo": str(r)}
+    if project_name != r.name:
+        return {
+            "ok": False,
+            "error": f"Open project is '{project_name}' but folder is '{r.name}' — open '{r.name}' in Resolve first",
+            "repo": str(r),
+            "resolve_project": project_name,
+        }
+    _save_known_timelines(r, current, all_names)
+    return {"ok": True, "repo": str(r), "current": current, "timelines": all_names}
 
 def _get_timeline_file(repo: Path, timeline_name: str | None) -> Path:
     """Resolve file for a timeline. Uses timelines/<safe>.otio if timelines/ exists or name given, else legacy timeline.otio."""
@@ -202,29 +130,6 @@ def _get_timeline_file(repo: Path, timeline_name: str | None) -> Path:
         if timeline_name:
             return timelines_dir / f"{_sanitize_timeline_name(timeline_name)}.otio"
     return repo / "timeline.otio"
-
-def _list_timeline_files(repo: Path) -> list[Path]:
-    """List all versioned timeline files in repo (timelines/*.otio + legacy)."""
-    files: list[Path] = []
-    timelines_dir = repo / "timelines"
-    if timelines_dir.exists():
-        files.extend(sorted(timelines_dir.glob("*.otio")))
-        files.extend(sorted(timelines_dir.glob("*.OTIO")))
-    # Legacy single file
-    legacy = repo / "timeline.otio"
-    if legacy.exists():
-        # Only include legacy if timelines folder is empty (backward compat)
-        if not files:
-            files.append(legacy)
-        # Also include legacy if it exists alongside timelines (for migration)
-        elif legacy not in files:
-            # Check if legacy is newer than timelines files? Include it anyway for status
-            files.append(legacy)
-    # Also check case-insensitive variants at root
-    for p in repo.glob("*.otio"):
-        if p not in files and p.name.lower() != "timeline.otio":
-            files.append(p)
-    return files
 
 def _resolve_repo(repo: str | Path | None) -> Path:
     if not repo:
@@ -379,37 +284,37 @@ def api_timelines(repo: str | Path | None = None) -> dict:
 
 def api_log(repo: str | Path | None = None, limit: int = 20, timeline: str | None = None) -> list[dict]:
     r = _resolve_repo(repo)
+    # Guard: non-existent or non-repo returns empty (strict per-repo isolation, no cross-project fallback)
+    try:
+        if not r.exists() or not git_store.is_git_repo(r):
+            return []
+    except Exception:
+        return []
     # Determine timeline file for log
     tf = None
     if timeline:
-        tf = _get_timeline_file(r, timeline)
-        rel = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
-        check = git_store._run_git(["log", "--all", "--", rel], cwd=r, check=False)
+        try:
+            tf = _get_timeline_file(r, timeline)
+            rel = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
+            check = git_store._run_git(["log", "--all", "--", rel], cwd=r, check=False)
+        except Exception:
+            return []
         if not check.stdout.strip():
             versions = []
         else:
             versions = git_store.log_versions(r, limit=limit, timeline_file=rel)
     else:
-        # No timeline filter: if activeTimeline is set via status, it will be passed as timeline param
-        # For All view (timeline=None), return log across all timeline files
+        # No timeline filter (All view): return log across all timeline files for this repo.
+        # Strictly per-repo, never across projects.
         timelines_dir = r / "timelines"
         if timelines_dir.exists() and any(timelines_dir.glob("*.otio")):
-            # Log across all timelines/*.otio
+            # Log across all timelines/*.otio for this repo
             versions = git_store.log_versions(r, limit=limit, timeline_file="timelines/*.otio")
             if not versions:
                 versions = git_store.log_versions(r, limit=limit)
         else:
-            # Try per-current timeline if available
-            cur, _ = _get_resolve_timelines(repo)
-            if cur:
-                tf = _get_timeline_file(r, cur)
-                rel = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
-                versions = git_store.log_versions(r, limit=limit, timeline_file=rel)
-                if not versions:
-                    # Fallback to all
-                    versions = git_store.log_versions(r, limit=limit)
-            else:
-                versions = git_store.log_versions(r, limit=limit)
+            # Legacy single-file or no timelines folder — show all commits for this repo
+            versions = git_store.log_versions(r, limit=limit)
     # enrich with preview path
     out = []
     for v in versions:
@@ -811,9 +716,9 @@ def api_graph_viz(repo: str | Path | None = None, timeline: str | None = None) -
             tf = _get_timeline_file(r, timeline)
             tfile = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
             log_r = subprocess.run(["git", "log", "--all", "--pretty=format:%H%x1f%P%x1f%D%x1f%s%x1f%ar%x1f%ad", "--date=short", "--reverse", "--", tfile], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace")
-            # Fallback to all if no commits for that file
+            # Do NOT fallback to all — if timeline has no history, return empty (strict per-timeline filtering)
             if log_r.returncode != 0 or not log_r.stdout.strip():
-                log_r = subprocess.run(["git", "log", "--all", "--pretty=format:%H%x1f%P%x1f%D%x1f%s%x1f%ar%x1f%ad", "--date=short", "--reverse"], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace")
+                return {"ok": True, "repo": str(r), "current": current, "branches": branches, "commits": [], "fork": None}
         else:
             log_r = subprocess.run(["git", "log", "--all", "--pretty=format:%H%x1f%P%x1f%D%x1f%s%x1f%ar%x1f%ad", "--date=short", "--reverse"], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace")
         if log_r.returncode != 0 or not log_r.stdout.strip():

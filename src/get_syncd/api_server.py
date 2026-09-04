@@ -24,17 +24,37 @@ from __future__ import annotations
 
 import json
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import mimetypes
 
 from . import api as core_api
 from .preview import _preview_path
 
+ALLOWED_ORIGINS = {
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "tauri://localhost",
+    "http://tauri.localhost",
+}
+
 def _cors_headers(handler: BaseHTTPRequestHandler):
-    handler.send_header("Access-Control-Allow-Origin", "*")
+    origin = handler.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS:
+        handler.send_header("Access-Control-Allow-Origin", origin)
+        handler.send_header("Vary", "Origin")
+    # No wildcard: browsers without Origin (Tauri sidecar, curl) don't need ACAO
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+
+def _repo_allowed(repo: str | None) -> bool:
+    try:
+        return core_api.is_repo_allowed(repo) if repo else True
+    except Exception:
+        return False
 
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
@@ -50,11 +70,18 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._json({"ok": True, "service": "get-syncd"})
             return
+        # Trust boundary: repo must stay under ~/GetSyncd
+        if repo and not _repo_allowed(repo):
+            self._json({"ok": False, "error": "Repo outside ~/GetSyncd not allowed"}, status=403)
+            return
         if parsed.path == "/api/status":
             self._json(core_api.api_status(repo))
             return
         if parsed.path == "/api/log":
-            limit = int(qs.get("limit", ["20"])[0])
+            try:
+                limit = max(1, min(int(qs.get("limit", ["20"])[0]), 100))
+            except ValueError:
+                limit = 20
             timeline = qs.get("timeline", [None])[0]
             self._json(core_api.api_log(repo, limit=limit, timeline=timeline))
             return
@@ -72,8 +99,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(core_api.api_graph_viz(repo, timeline=timeline))
             return
         if parsed.path == "/api/diff":
-            a = qs.get("a", ["HEAD~1"])[0]
-            b = qs.get("b", ["HEAD"])[0]
+            a = qs.get("a", ["HEAD~1"])[0][:80]
+            b = qs.get("b", ["HEAD"])[0][:80]
             timeline = qs.get("timeline", [None])[0]
             try:
                 data = core_api.api_diff(repo, a, b, timeline=timeline)
@@ -87,15 +114,27 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/resolve/projects":
             self._json(core_api.api_scan_resolve_projects())
             return
+        if parsed.path == "/api/resolve/current":
+            self._json(core_api.api_get_current_resolve())
+            return
         if parsed.path == "/api/preview":
             h = qs.get("hash", [""])[0]
-            if not h:
-                self.send_error(400, "hash required")
+            if not h or not h.replace("-", "").replace("_", "").isalnum():
+                self.send_error(400, "invalid hash")
                 return
             # find preview file
             from pathlib import Path as P
             r = core_api._resolve_repo(repo)
+            if not core_api.is_repo_allowed(r):
+                self._json({"ok": False, "error": "Repo outside ~/GetSyncd not allowed"}, status=403)
+                return
             p = _preview_path(r, h)
+            # Contain preview path inside repo (no traversal)
+            try:
+                p.resolve().relative_to(r.resolve())
+            except ValueError:
+                self.send_error(404, "preview not found")
+                return
             if not p.exists():
                 self.send_error(404, "preview not found")
                 return
@@ -116,7 +155,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             data = {}
         repo = data.get("repo") or urllib.parse.parse_qs(parsed.query).get("repo", [None])[0]
+        if repo and not _repo_allowed(repo):
+            self._json({"ok": False, "error": "Repo outside ~/GetSyncd not allowed"}, status=403)
+            return
 
+        if parsed.path == "/api/resolve/sync":
+            res = core_api.api_sync_resolve(repo)
+            self._json(res, status=200 if res.get("ok") else 400)
+            return
         if parsed.path == "/api/save":
             res = core_api.api_save(repo, file=data.get("file"), message=data.get("message"), timeline=data.get("timeline"), all_timelines=bool(data.get("all_timelines")))
             self._json(res, status=200 if res.get("ok") else 400)
@@ -165,10 +211,13 @@ class Handler(BaseHTTPRequestHandler):
         sys.stdout.write(f"[api] {format % args}\n")
 
 def run_api_server(port: int = 5174, open_browser: bool = False):
-    # try ports 5174..5184
+    # Threading server: concurrent tab switches/polls must not queue behind
+    # each other (HTTPServer is single-threaded). Handlers are stateless
+    # except the Resolve TTL cache, which is read-mostly and GIL-guarded.
     for p in range(port, port+10):
         try:
-            httpd = HTTPServer(("127.0.0.1", p), Handler)
+            httpd = ThreadingHTTPServer(("127.0.0.1", p), Handler)
+            httpd.daemon_threads = True
             print(f"Get Syncd API listening on http://127.0.0.1:{p}")
             print(f"  GET /api/status?repo=~/GetSyncd")
             print(f"  GET /api/log?repo=~/GetSyncd")

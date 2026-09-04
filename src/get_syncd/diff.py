@@ -449,6 +449,100 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
     return result
 
 
+def _plural_tracks(n: int, kind: str) -> str:
+    """'1 video track' vs '2 video tracks'. Kind is 'video track', 'audio track' or 'track'."""
+    return f"{n} {kind}{'' if n == 1 else 's'}"
+
+
+def _format_track_names(names: list[str], max_show: int = 4) -> str:
+    """'Video 2, Video 3' or 'A, B, C and 2 more' when long."""
+    if len(names) <= max_show:
+        return ", ".join(names)
+    shown = ", ".join(names[:max_show])
+    return f"{shown} and {len(names) - max_show} more"
+
+
+def _describe_track_list_change(old: NormalizedTimeline, new: NormalizedTimeline) -> str:
+    """Plain-English description of added/removed tracks, e.g.
+    'Added 2 video tracks (Video 2, Video 3) and 1 audio track (Audio 3)'.
+    Never dumps raw Python arrays.
+    """
+    old_names = [t.name for t in old.tracks]
+    new_names = [t.name for t in new.tracks]
+    old_set, new_set = set(old_names), set(new_names)
+    added = [n for n in new_names if n not in old_set]
+    removed = [n for n in old_names if n not in new_set]
+
+    new_kind = {t.name: t.kind for t in new.tracks}
+    old_kind = {t.name: t.kind for t in old.tracks}
+
+    def _group(names: list[str], lookup: dict) -> tuple[list[str], list[str], list[str]]:
+        video, audio, other = [], [], []
+        for n in names:
+            k = lookup.get(n, "")
+            if k == "Video":
+                video.append(n)
+            elif k == "Audio":
+                audio.append(n)
+            else:
+                other.append(n)
+        return video, audio, other
+
+    added_video, added_audio, added_other = _group(added, new_kind)
+    removed_video, removed_audio, removed_other = _group(removed, old_kind)
+
+    def _join_groups(groups: list[tuple[list[str], str]], verb: str) -> str:
+        # groups: [(names, kind_label)] non-empty only, e.g. [(['Video 2','Video 3'], 'video track')]
+        parts = []
+        for names, kind_label in groups:
+            parts.append(f"{_plural_tracks(len(names), kind_label)} ({_format_track_names(names)})")
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return f"{verb} {parts[0]}"
+        # "Added X and Y" — verb only on first part
+        return f"{verb} {parts[0]} and " + " and ".join(parts[1:])
+
+    added_groups = [
+        (added_video, "video track"),
+        (added_audio, "audio track"),
+        (added_other, "track"),
+    ]
+    added_groups = [(names, kind) for names, kind in added_groups if names]
+    removed_groups = [
+        (removed_video, "video track"),
+        (removed_audio, "audio track"),
+        (removed_other, "track"),
+    ]
+    removed_groups = [(names, kind) for names, kind in removed_groups if names]
+
+    added_sentence = _join_groups(added_groups, "Added") if added_groups else ""
+    removed_sentence = _join_groups(removed_groups, "Removed") if removed_groups else ""
+
+    if added_sentence and removed_sentence:
+        # Lowercase second verb after semicolon for natural reading
+        removed_sentence = removed_sentence[0].lower() + removed_sentence[1:]
+        return f"{added_sentence}; {removed_sentence}"
+    if added_sentence:
+        return added_sentence
+    if removed_sentence:
+        return removed_sentence
+    # Fallback (sets differ but no clean added/removed, e.g. duplicates)
+    return f"Tracks changed — now {len(new_names)} tracks (was {len(old_names)} tracks)"
+
+
+def _describe_track_counts(old: NormalizedTimeline, new: NormalizedTimeline) -> str:
+    """Scope note when video/audio track counts differ, e.g.
+    'Now 3 video tracks + 3 audio tracks (was 1 video track + 2 audio tracks) — ...'."""
+    old_v, old_a = len(old.video_tracks()), len(old.audio_tracks())
+    new_v, new_a = len(new.video_tracks()), len(new.audio_tracks())
+    return (
+        f"Now {_plural_tracks(new_v, 'video track')} + {_plural_tracks(new_a, 'audio track')} "
+        f"(was {_plural_tracks(old_v, 'video track')} + {_plural_tracks(old_a, 'audio track')}) "
+        f"— only the main track is compared, check the others manually"
+    )
+
+
 def diff_timelines(
     old: NormalizedTimeline,
     new: NormalizedTimeline,
@@ -460,12 +554,12 @@ def diff_timelines(
     By default diffs the main video track. If compare_all_video_tracks is True,
     diffs each video track separately and concatenates results.
     """
-    # Check track mismatch warnings
+    # Check track mismatch warnings (plain English, no raw array dumps)
     warnings = []
     old_names = [t.name for t in old.tracks]
     new_names = [t.name for t in new.tracks]
     if set(old_names) != set(new_names):
-        warnings.append(f"Track list changed: {old_names} -> {new_names}")
+        warnings.append(_describe_track_list_change(old, new))
 
     if track_name:
         old_track = next((t for t in old.tracks if t.name == track_name), None)
@@ -540,7 +634,7 @@ def diff_timelines(
     d.warnings.extend(warnings)
     # Also warn if audio/video track counts differ (flag, don't guess)
     if len(old.video_tracks()) != len(new.video_tracks()) or len(old.audio_tracks()) != len(new.audio_tracks()):
-        d.warnings.append(f"Track counts differ: old {len(old.video_tracks())}V/{len(old.audio_tracks())}A, new {len(new.video_tracks())}V/{len(new.audio_tracks())}A — auto-merge not safe for multi-track changes")
+        d.warnings.append(_describe_track_counts(old, new))
     return d
 
 

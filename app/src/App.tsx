@@ -1,33 +1,57 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const API = 'http://127.0.0.1:5174'
 const DEFAULT_REPO = '/Users/mihailmihaylov/GetSyncd'
+const POLL_MS = 10000
 
-type Version = { hash: string; short: string; author: string; date: string; message: string; preview?: string }
-type Status = { is_repo: boolean; has_changes: boolean | null; message: string; current_branch?: string; branches?: string[], timelines?: any[], current_timeline?: string | null, all_timelines?: string[] }
+type Version = { hash: string; short: string; author: string; date: string; message: string; preview?: string; timeline?: string }
+type TimelineInfo = { name: string; file: string; has_changes: boolean | null; message: string; stat?: string }
+type Status = { repo?: string; is_repo: boolean; has_changes: boolean | null; message: string; candidate?: string; current_branch?: string; branches?: string[], timelines?: TimelineInfo[], current_timeline?: string | null, all_timelines?: string[] }
+type GraphCommit = { hash: string; short: string; message: string; relative?: string; date: string; lane?: number; isBranch?: boolean; isFork?: boolean; isCurrent?: boolean; branches?: string[] }
+type Graph = { ok?: boolean; current?: string; branches?: string[]; altBranch?: string | null; fork?: string | null; commits?: GraphCommit[] }
+type DiffChange = { type: string; index_old?: number | null; index_new?: number | null; clip_name?: string; kind?: string; details?: Record<string, number | string | boolean | undefined> }
+type Diff = { summary?: { added?: number; removed?: number; trimmed?: number; reordered?: number; gap_changed?: number; total_changes?: number; runtime_delta_s?: number }; changes?: DiffChange[]; warnings?: string[]; new_track?: { items?: { name?: string }[] } | null }
 
 export default function App() {
   const [repo, setRepo] = useState(DEFAULT_REPO)
   const [status, setStatus] = useState<Status | null>(null)
   const [log, setLog] = useState<Version[]>([])
   const [selected, setSelected] = useState<Version | null>(null)
-  const [diff, setDiff] = useState<any>(null)
+  const [diff, setDiff] = useState<Diff | null>(null)
   const [note, setNote] = useState('')
   const [showSave, setShowSave] = useState(false)
   const [showSetup, setShowSetup] = useState(false)
   const [syncStep, setSyncStep] = useState<string | null>(null)
   const [folder, setFolder] = useState(DEFAULT_REPO)
   const [projects, setProjects] = useState<{name:string,path:string}[]>([])
-  const [graph, setGraph] = useState<any>(null)
-  const [timelines, setTimelines] = useState<any[]>([])
+  const [graph, setGraph] = useState<Graph | null>(null)
+  const [timelines, setTimelines] = useState<TimelineInfo[]>([])
   const [activeTimeline, setActiveTimeline] = useState<string | null>(null)
   const [showTimelinePicker, setShowTimelinePicker] = useState(false)
+  const [showAllChanges, setShowAllChanges] = useState(false)
+  const [infoModal, setInfoModal] = useState<{title:string, body:string} | null>(null)
+  const [pendingForceDelete, setPendingForceDelete] = useState<string | null>(null)
   const [toast, setToast] = useState<{msg:string, type:'success'|'error'|'info'}|null>(null)
-  const showToast = (msg:string, type:'success'|'error'|'info'='success') => { setToast({msg, type}); setTimeout(()=>setToast(null), 2600) }
+  const toastTimer = useRef<number | null>(null)
+  const showToast = (msg:string, type:'success'|'error'|'info'='success') => {
+    setToast({msg, type})
+    if (toastTimer.current) window.clearTimeout(toastTimer.current)
+    toastTimer.current = window.setTimeout(()=>setToast(null), 2600)
+  }
+  const showInfo = (title:string, body:string, toastType:'success'|'error'|'info'='info') => {
+    setInfoModal({title, body})
+    showToast(title, toastType)
+  }
+  const audioCtx = useRef<AudioContext | null>(null)
   const playSound = (type:'click'|'success'|'delete'|'pop'='click') => {
     try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
+      if (!audioCtx.current) {
+        const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+        audioCtx.current = new AC()
+      }
+      const ctx = audioCtx.current
+      if (ctx.state === 'suspended') void ctx.resume()
       const o = ctx.createOscillator(); const g = ctx.createGain(); o.connect(g); g.connect(ctx.destination)
       const n = ctx.currentTime
       if (type==='click') { o.frequency.value=820; g.gain.setValueAtTime(0.13, n); g.gain.exponentialRampToValueAtTime(0.01, n+0.11); o.start(n); o.stop(n+0.12) }
@@ -72,76 +96,188 @@ export default function App() {
     if (c.type==='gap_changed') return `Gap ${name} changed`
     return `${c.type} ${name}`
   }
-
-  const api = async (path: string, opts?: RequestInit) => {
-    const url = `${API}${path}${path.includes('?') ? '&' : '?'}repo=${encodeURIComponent(repo)}`
-    const r = await fetch(url, opts)
-    return r.json()
+  const humanizeWarning = (w:string) => {
+    if (!w) return w
+    // Already human-friendly (new backend) — pass through
+    if (/^(Added|Removed|Tracks changed|Now \d)/.test(w.trim())) return w
+    // Legacy: "Track list changed: ['Video 1', ...] -> [...]" or "Tracks: [...] -> [...]"
+    const listMatch = w.match(/(?:Track list changed|Tracks):\s*\[(.*?)\]\s*->\s*\[(.*?)\]/)
+    if (listMatch) {
+      const parseNames = (s:string) => {
+        const out:string[] = []
+        const re = /'([^']*)'|"([^"]*)"/g
+        let m:any
+        while ((m = re.exec(s)) !== null) out.push(m[1] ?? m[2])
+        return out.filter(x=>x!=='')
+      }
+      const oldNames = parseNames(listMatch[1])
+      const newNames = parseNames(listMatch[2])
+      const added = newNames.filter(n=>!oldNames.includes(n))
+      const removed = oldNames.filter(n=>!newNames.includes(n))
+      const kindOf = (n:string) => /video/i.test(n) ? 'video track' : /audio/i.test(n) ? 'audio track' : 'track'
+      const group = (names:string[]) => {
+        const byKind: Record<string,string[]> = {}
+        for (const n of names) {
+          const k = kindOf(n)
+          byKind[k] = byKind[k] || []
+          byKind[k].push(n)
+        }
+        return Object.entries(byKind).map(([k, ns]) => `${ns.length} ${k}${ns.length>1?'s':''} (${ns.length<=4?ns.join(', '):ns.slice(0,3).join(', ')+` and ${ns.length-3} more`})`)
+      }
+      const parts:string[] = []
+      const ag = group(added)
+      const rg = group(removed)
+      if (ag.length) parts.push(`Added ${ag[0]}${ag.length>1?' and '+ag.slice(1).join(' and '):''}`)
+      if (rg.length) {
+        const r = `Removed ${rg[0]}${rg.length>1?' and '+rg.slice(1).join(' and '):''}`
+        parts.push(parts.length ? r[0].toLowerCase()+r.slice(1) : r)
+      }
+      if (parts.length) return parts.join('; ')
+      return `Tracks changed — now ${newNames.length} tracks (was ${oldNames.length} tracks)`
+    }
+    // Legacy: "Track counts differ: old 1V/2A, new 3V/3A — ..."
+    const countMatch = w.match(/old\s*(\d+)V\/(\d+)A,\s*new\s*(\d+)V\/(\d+)A/)
+    if (countMatch) {
+      const [, ov, oa, nv, na] = countMatch.map(Number)
+      const p = (n:number,k:string) => `${n} ${k}${n===1?'':'s'}`
+      return `Now ${p(nv,'video track')} + ${p(na,'audio track')} (was ${p(ov,'video track')} + ${p(oa,'audio track')}) — only the main track is compared, check the others manually`
+    }
+    // Final safety net: never show raw Python arrays
+    return w.replace(/Track list changed:/, 'Tracks changed:').replace(/auto-merge not safe/, 'check the others manually').replace(/\[|\]|'/g, '')
   }
 
-  const refreshProjects = async () => {
+  const api = async (path: string, opts?: RequestInit, repoOverride?: string, signal?: AbortSignal) => {
+    const useRepo = repoOverride ?? repoRef.current
+    const url = `${API}${path}${path.includes('?') ? '&' : '?'}repo=${encodeURIComponent(useRepo)}`
+    const r = await fetch(url, { ...opts, signal })
+    const text = await r.text()
+    let data: unknown = null
+    try { data = text ? JSON.parse(text) : null } catch { data = { ok: false, error: text.slice(0, 200) } }
+    if (!r.ok) {
+      const msg = (data as { error?: string })?.error || `Request failed (${r.status})`
+      throw new Error(msg)
+    }
+    return data as never
+  }
+
+  const hasAutoSelectedRef = useRef(false)
+  const refreshProjects = async (signal?: AbortSignal) => {
     try {
-      const r = await fetch(`${API}/api/projects`).then(x=>x.json())
+      const r = await fetch(`${API}/api/projects`, { signal }).then(x=>{
+        if (!x.ok) throw new Error(`projects failed (${x.status})`)
+        return x.json()
+      }) as { ok?: boolean; projects?: {name:string,path:string}[] }
       if (r.ok) {
         const projs = r.projects || []
         setProjects(projs)
-        // If current repo is the base container (not a project) or not in list, switch to first project
-        if (projs.length && !projs.find((p:any)=>p.path===repo)) {
-          // Don't auto-switch if repo is already a valid project, only if it's the base
-          if (repo === DEFAULT_REPO) {
-            setRepo(projs[0].path)
+        // First load only: if still on container path, switch to first project (no N+1 log fan-out)
+        if (!hasAutoSelectedRef.current && projs.length && repoRef.current === DEFAULT_REPO) {
+          const first = projs[0]
+          if (first && first.path !== repoRef.current) {
+            setRepo(first.path)
             setSelected(null)
           }
+          hasAutoSelectedRef.current = true
         }
       }
-    } catch {}
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') return
+    }
   }
 
   const scanResolve = async () => {
     playSound('click')
-    const r = await fetch(`${API}/api/resolve/scan`, {method:'POST'}).then(x=>x.json())
-    refreshProjects(); refresh()
-    if (!r.ok) {
-      playSound('pop')
-      const hint = r.folders?.length ? `\n\nExisting projects: ${r.folders.map((f:any)=>f.name).join(', ')}` : ''
-      alert((r.error || 'Resolve not running') + hint + '\n\nYou can still Create Project manually with the button or type a name.')
-      return
+    try {
+      const r = await fetch(`${API}/api/resolve/scan`, {method:'POST'}).then(x=>x.json()) as { ok?: boolean; error?: string; created?: string[]; projects?: string[]; folders?: {name:string}[] }
+      refreshProjects(); refresh()
+      if (!r.ok) {
+        playSound('pop')
+        const hint = r.folders?.length ? `Existing projects: ${r.folders.map(f=>f.name).join(', ')}` : ''
+        showInfo('Resolve not running', `${r.error || 'Resolve not running'}${hint ? '\n\n' + hint : ''}\n\nYou can still Create Project manually.`, 'error')
+        return
+      }
+      playSound('success'); showToast(r.created?.length ? `Created ${r.created.join(', ')}` : 'Scanned Resolve ✓', 'success')
+      if (r.created?.length) showInfo('Projects created', `Created folders for: ${r.created.join(', ')}`, 'success')
+      else if (!r.projects?.length) showInfo('No Resolve projects', 'No Resolve projects found — open a project in Resolve first. Existing GetSyncd projects shown.', 'info')
+    } catch (e) {
+      showInfo('Scan failed', e instanceof Error ? e.message : 'Scan failed', 'error')
     }
-    playSound('success'); showToast(r.created?.length ? `Created ${r.created.join(', ')}` : 'Scanned Resolve ✓', 'success')
-    if (r.created?.length) alert(`Created folders for: ${r.created.join(', ')}`)
-    else if (!r.projects?.length) alert(`No Resolve projects found — open a project in Resolve first. Existing GetSyncd projects shown.`)
+  }
+
+  const syncFromResolve = async () => {
+    playSound('click')
+    try {
+      const r = await fetch(`${API}/api/resolve/sync?repo=${encodeURIComponent(repoRef.current)}`, {method:'POST'}).then(x=>x.json()) as { ok?: boolean; error?: string; timelines?: string[]; resolve_project?: string }
+      if (!r.ok) {
+        playSound('pop')
+        showInfo('Sync from Resolve', r.error || 'Sync failed — open the matching project in Resolve first.', 'error')
+        return
+      }
+      playSound('success'); showToast(`Synced timelines from Resolve ✓ (${r.timelines?.length || 0})`, 'success')
+      refresh()
+    } catch (e) {
+      showInfo('Sync failed', e instanceof Error ? e.message : 'Sync failed', 'error')
+    }
   }
 
   const [showRestore, setShowRestore] = useState<Version | null>(null)
   const [showDelete, setShowDelete] = useState<Version | null>(null)
+  const timelineExplicitlySetRef = useRef(false)
+  const repoRef = useRef(repo)
+  repoRef.current = repo
+  const activeTimelineRef = useRef<string | null>(activeTimeline)
+  activeTimelineRef.current = activeTimeline
 
-  const refresh = async () => {
+  const refresh = async (signal?: AbortSignal) => {
+    const repoAtStart = repoRef.current
+    const timelineAtStart = activeTimelineRef.current
     try {
-      const s = await api('/api/status')
+      const s = await api('/api/status', undefined, repoAtStart, signal) as Status
+      // Guard against stale response after repo switch — strict per-project isolation
+      if (repoAtStart !== repoRef.current) return
+      if (s.repo && s.repo !== repoAtStart) return
       setStatus(s)
       if (!s.is_repo) { setShowSetup(true); return }
       setShowSetup(false)
-      // Timelines: use status.timelines or fetch dedicated
+      // Determine effective timeline for this refresh — strictly per-project
+      let effTimeline = timelineAtStart
       if (s.timelines) {
+        // Extra guard: ensure timelines belong to this repo (s.repo matches)
         setTimelines(s.timelines)
-        if (s.current_timeline && !activeTimeline) setActiveTimeline(s.current_timeline)
-        else if (s.all_timelines?.length && !activeTimeline) setActiveTimeline(s.all_timelines[0])
-        else if (s.timelines.length && !activeTimeline) setActiveTimeline(s.timelines[0].name)
+        const names = (s.timelines as any[]).map((t:any)=>t.name)
+        const all = s.all_timelines || names
+        // Only auto-set activeTimeline on first load or when repo changed and no explicit choice
+        const isExplicitAll = timelineExplicitlySetRef.current && timelineAtStart === null
+        if (!isExplicitAll && (!effTimeline || !names.includes(effTimeline))) {
+          effTimeline = s.current_timeline || (all[0] as any) || (s.timelines[0] as any)?.name || null
+          if (effTimeline && effTimeline !== timelineAtStart) {
+            setActiveTimeline(effTimeline)
+            timelineExplicitlySetRef.current = false
+          }
+        } else if (isExplicitAll) {
+          effTimeline = null
+        }
       } else {
         try {
-          const t = await api('/api/timelines')
+          const t = await api('/api/timelines', undefined, repoAtStart, signal) as { ok?: boolean; repo?: string; timelines?: TimelineInfo[]; current?: string | null }
+          if (repoAtStart !== repoRef.current) return
           if (t?.ok) {
+            // Guard: t.repo should match repoAtStart if present
+            if (t.repo && t.repo !== repoAtStart) return
             setTimelines(t.timelines || [])
-            if (t.current && !activeTimeline) setActiveTimeline(t.current)
+            if (t.current && !effTimeline) {
+              effTimeline = t.current
+              setActiveTimeline(t.current)
+            }
           }
-        } catch {}
+        } catch (e) {
+          if ((e as Error)?.name === 'AbortError') return
+        }
       }
-      const tlParam = activeTimeline ? `&timeline=${encodeURIComponent(activeTimeline)}` : ''
-      let l = await api(`/api/log?limit=30${tlParam}`)
-      // Fallback to legacy log if timeline-specific is empty
-      if (Array.isArray(l) && l.length===0 && activeTimeline) {
-        try { const fallback = await api(`/api/log?limit=30`); if (Array.isArray(fallback) && fallback.length) l = fallback } catch {}
-      }
+      // Use effTimeline consistently for both log and graph — strict per-timeline filtering
+      const tlParam = effTimeline ? `&timeline=${encodeURIComponent(effTimeline)}` : ''
+      const l = await api(`/api/log?limit=30${tlParam}`, undefined, repoAtStart, signal) as Version[]
+      if (repoAtStart !== repoRef.current) return
       if (Array.isArray(l)) {
         setLog(l)
         setSelected(prev => {
@@ -152,23 +288,40 @@ export default function App() {
         })
       }
       try {
-        const g = await api(`/api/graph/viz${activeTimeline?`?timeline=${encodeURIComponent(activeTimeline)}`:''}`)
+        const g = await api(`/api/graph/viz${effTimeline?`?timeline=${encodeURIComponent(effTimeline)}`:''}`, undefined, repoAtStart, signal) as Graph
+        if (repoAtStart !== repoRef.current) return
         if (g?.ok) setGraph(g)
         else if (Array.isArray(g?.commits)) setGraph(g)
         else setGraph(null)
-      } catch { setGraph(null) }
-    } catch (e) { console.error(e) }
+      } catch (e) { if ((e as Error)?.name !== 'AbortError' && repoAtStart === repoRef.current) setGraph(null) }
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') return
+      console.error(e)
+    }
   }
 
-  useEffect(() => { refreshProjects(); refresh(); const id=setInterval(refresh, 3000); return ()=>clearInterval(id) }, [repo, activeTimeline])
-  useEffect(()=>{ refreshProjects() }, [log.length])
+  useEffect(() => {
+    // Clear stale per-project state immediately on repo switch — prevents flash of old timelines/commits
+    setTimelines([])
+    setLog([])
+    setGraph(null)
+    setSelected(null)
+    setDiff(null)
+    setShowAllChanges(false)
+    const ctl = new AbortController()
+    refreshProjects(ctl.signal); refresh(ctl.signal)
+    const id = window.setInterval(()=>{ refreshProjects(ctl.signal); refresh(ctl.signal) }, POLL_MS)
+    return ()=>{ ctl.abort(); window.clearInterval(id) }
+  }, [repo, activeTimeline])
   useEffect(() => {
     if (!selected || log.length<2) return
+    const ctl = new AbortController()
     const idx = log.findIndex(v=>v.hash===selected.hash)
     const a = idx+1<log.length ? log[idx+1].hash : selected.hash
-    const tl = activeTimeline ? `&timeline=${encodeURIComponent(activeTimeline)}` : ''
-    api(`/api/diff?a=${a}&b=${selected.hash}${tl}`).then(setDiff).catch(()=>setDiff(null))
-  }, [selected, activeTimeline])
+    const tl = activeTimelineRef.current ? `&timeline=${encodeURIComponent(activeTimelineRef.current)}` : ''
+    api(`/api/diff?a=${a}&b=${selected.hash}${tl}`, undefined, undefined, ctl.signal).then(d=>setDiff(d as Diff)).catch(e=>{ if ((e as Error)?.name !== 'AbortError') setDiff(null) })
+    return ()=>ctl.abort()
+  }, [selected, log.length])
 
   const doSave = async () => {
     playSound('click')
@@ -192,11 +345,11 @@ export default function App() {
       console.warn('Export call failed', e)
     }
     setSyncStep('Checking changes...')
-    const st = await api('/api/status')
-    if (!st.has_changes) { playSound('pop'); showToast('No changes to save', 'info'); alert('No changes to save — edit in Resolve and re-export ~/GetSyncd/timeline.otio first' + (st.message?.includes('Found') ? `\n\nFound: ${st.candidate || ''}` : '')); setSyncStep(null); return }
+    const st = await api('/api/status') as Status
+    if (!st.has_changes) { playSound('pop'); showInfo('No changes to save', 'Edit in Resolve and re-export ~/GetSyncd/timeline.otio first' + (st.message?.includes('Found') ? `\n\nFound: ${st.candidate || ''}` : ''), 'info'); setSyncStep(null); return }
     setSyncStep('Creating version...')
     const res = await fetch(`${API}/api/save`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, message: note || undefined, timeline: activeTimeline || undefined})}).then(r=>r.json())
-    if (!res.ok) { playSound('delete'); showToast(res.error, 'error'); alert(res.error); setSyncStep(null); return }
+    if (!res.ok) { playSound('delete'); showInfo('Save failed', res.error, 'error'); setSyncStep(null); return }
     // Show which timeline was saved
     const tlMsg = res.timeline ? ` • ${res.timeline}` : ''
     setSyncStep('Syncing with GitHub...')
@@ -216,16 +369,16 @@ export default function App() {
     setShowRestore(null)
     playSound('click')
     setSyncStep(`Restoring to ${v.short}...`)
-    const res = await fetch(`${API}/api/restore`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, rev: v.hash, apply: true, timeline: activeTimeline || (v as any).timeline || undefined})}).then(r=>r.json())
-    if (!res.ok) { playSound('delete'); showToast(`Restore failed`, 'error'); alert(`Restore failed: ${res.error}\nYour current work was not deleted.`); setSyncStep(null); return }
+    const res = await fetch(`${API}/api/restore`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, rev: v.hash, apply: true, timeline: activeTimeline || v.timeline || undefined})}).then(r=>r.json())
+    if (!res.ok) { playSound('delete'); showInfo('Restore failed', `${res.error}\nYour current work was not deleted.`, 'error'); setSyncStep(null); return }
     playSound('success'); showToast(`Restored to ${v.short} ✓`, 'success')
     setSyncStep(`Restored to ${v.short} ✓`)
     refresh()
     setTimeout(()=>setSyncStep(null), 1500)
     if (res.auto_import) {
-      alert(`Restored to ${v.short} and auto-imported into Resolve ✓\n${res.auto_import_msg}\n\nNo manual import needed — just play the timeline in Resolve.`)
+      showInfo(`Restored to ${v.short}`, `${res.auto_import_msg}\n\nNo manual import needed — just play the timeline in Resolve.`, 'success')
     } else {
-      alert(`Restored to ${v.short}\n${res.auto_import_msg || ''}\n\nIn Resolve: File → Import Timeline → OpenTimelineIO → timeline.otio`)
+      showInfo(`Restored to ${v.short}`, `${res.auto_import_msg || ''}\n\nIn Resolve: File → Import Timeline → OpenTimelineIO → timeline.otio`, 'success')
     }
   }
 
@@ -236,8 +389,8 @@ export default function App() {
     setShowDelete(null)
     playSound('delete')
     setSyncStep(`Deleting ${v.short}...`)
-    const res = await fetch(`${API}/api/delete`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, rev: v.hash, timeline: activeTimeline || (v as any).timeline || undefined})}).then(r=>r.json())
-    if (!res.ok) { playSound('delete'); showToast(`Delete failed`, 'error'); alert(`Delete failed: ${res.error}`); setSyncStep(null); return }
+    const res = await fetch(`${API}/api/delete`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, rev: v.hash, timeline: activeTimeline || v.timeline || undefined})}).then(r=>r.json())
+    if (!res.ok) { playSound('delete'); showInfo('Delete failed', res.error, 'error'); setSyncStep(null); return }
     playSound('delete'); showToast(`Deleted ${v.short}`, 'success')
     setSyncStep(`Deleted ${v.short} ✓`)
     if (selected?.hash === v.hash) setSelected(null)
@@ -249,20 +402,20 @@ export default function App() {
     setSyncStep('Syncing with GitHub...')
     // naive: try push via CLI? For now just status
     try {
-      const s = await api('/api/status')
-      if (!s.is_repo) { alert('No project yet — Create Project first'); setSyncStep(null); return }
+      const s = await api('/api/status') as Status
+      if (!s.is_repo) { showInfo('No project yet', 'Create Project first', 'info'); setSyncStep(null); return }
       // In real app, call POST /api/push
       setSyncStep('Complete ✓')
       setTimeout(()=>setSyncStep(null), 1200)
     } catch (e:any) {
-      alert(`SYNC FAILED\n\nYour local project has not been deleted.\n${e.message}\n\n[Reconnect GitHub] [Retry]`)
+      showInfo('Sync failed', `Your local project has not been deleted.\n${e.message}`, 'error')
       setSyncStep(null)
     }
   }
 
   const doCreate = async () => {
     const r = await fetch(`${API}/api/init`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: folder})}).then(r=>r.json())
-    if (!r.ok) alert(r.error)
+    if (!r.ok) showInfo('Create failed', r.error, 'error')
     else { setRepo(folder); setShowSetup(false); refresh() }
   }
 
@@ -317,7 +470,7 @@ export default function App() {
     playSound('click')
     setSyncStep(`Switching to ${trimmed}...`)
     const r = await fetch(`${API}/api/branch`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, name: trimmed})}).then(r=>r.json())
-    if (!r.ok) { playSound('delete'); showToast(r.error, 'error'); alert(r.error); setSyncStep(null); return }
+    if (!r.ok) { playSound('delete'); showInfo('Branch switch failed', r.error, 'error'); setSyncStep(null); return }
     playSound('success'); showToast(`Switched to ${trimmed} ✓`, 'success')
     setSyncStep(`Switched to ${trimmed} ✓`)
     refresh()
@@ -330,7 +483,7 @@ export default function App() {
     playSound('click')
     setSyncStep(`Creating ${trimmed}...`)
     const r = await fetch(`${API}/api/branch`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, name: trimmed})}).then(r=>r.json())
-    if (!r.ok) { playSound('delete'); showToast(r.error, 'error'); alert(r.error); setSyncStep(null); return }
+    if (!r.ok) { playSound('delete'); showInfo('Branch create failed', r.error, 'error'); setSyncStep(null); return }
     playSound('success'); showToast(`Created ${trimmed} ✓`, 'success')
     setSyncStep(`Created ${trimmed} ✓`)
     setNewBranch('')
@@ -344,19 +497,19 @@ export default function App() {
         <div className="brand">
           <img src="/getsyncd-icon.png" alt="Get Syncd" style={{width:32, height:32, borderRadius:8, objectFit:'cover'}} />
           Get Syncd
-          <span className="branch" onClick={switchBranch} title="Click to switch or create branch" style={{cursor:'pointer'}}>
+          <span className="branch" onClick={switchBranch} title="Click to switch or create branch" role="button" tabIndex={0} aria-label={`Switch branch (current: ${status?.current_branch || 'main'})`} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();switchBranch()}}} style={{cursor:'pointer'}}>
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
   {status?.current_branch || 'main'}
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
 </span>
-          <span className="branch" onClick={()=>setShowTimelinePicker(true)} title="Current timeline — click to switch" style={{cursor:'pointer', background: activeTimeline ? 'var(--orange-soft)' : undefined, borderColor: activeTimeline ? 'var(--orange-border)' : undefined, color: activeTimeline ? 'var(--orange)' : undefined}}>
+          <span className="branch" onClick={()=>{setShowTimelinePicker(true); playSound('click')}} title="Current timeline — click to switch" role="button" tabIndex={0} aria-label={`Switch timeline (current: ${activeTimeline || status?.current_timeline || 'timeline'})`} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();setShowTimelinePicker(true);playSound('click')}}} style={{cursor:'pointer', background: activeTimeline ? 'var(--orange-soft)' : undefined, borderColor: activeTimeline ? 'var(--orange-border)' : undefined, color: activeTimeline ? 'var(--orange)' : undefined}}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="2" width="20" height="20" rx="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/></svg>
-            {activeTimeline || status?.current_timeline || 'timeline'} {status?.timelines?.find((t:any)=>t.name===activeTimeline)?.has_changes ? '•' : ''}
+            {activeTimeline || status?.current_timeline || 'timeline'} {status?.timelines?.find(t=>t.name===activeTimeline)?.has_changes ? '•' : ''}
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="m6 9 6 6 6-6"/></svg>
           </span>
         </div>
         <div className="actions">
-          {status?.has_changes ? <span className="unsaved" title={status.timelines?.filter((t:any)=>t.has_changes).map((t:any)=>t.name).join(', ') || ''}>● {status.timelines?.filter((t:any)=>t.has_changes).length ? `${status.timelines.filter((t:any)=>t.has_changes).length} timeline${status.timelines.filter((t:any)=>t.has_changes).length>1?'s':''} changed` : 'Unsaved changes'}</span> : <span className="saved">Up to date</span>}
+          {status?.has_changes ? <span className="unsaved" title={status.timelines?.filter(t=>t.has_changes).map(t=>t.name).join(', ') || ''}>● {status.timelines?.filter(t=>t.has_changes).length ? `${status.timelines.filter(t=>t.has_changes).length} timeline${status.timelines.filter(t=>t.has_changes).length>1?'s':''} changed` : 'Unsaved changes'}</span> : <span className="saved">Up to date</span>}
           <button onClick={()=>setShowSave(true)} className="primary">Save {activeTimeline && activeTimeline!=='timeline' ? activeTimeline : 'version'}</button>
           <button onClick={doSync} className="ghost">Sync</button>
         </div>
@@ -367,9 +520,10 @@ export default function App() {
       <div className="tabs">
         <div className="tabList">
           {projects.map(p=>(
-            <button key={p.path} className={`tab ${repo===p.path?'active':''}`} onClick={()=>{setRepo(p.path); setSelected(null)}}>{p.name}</button>
+            <button key={p.path} className={`tab ${repo===p.path?'active':''}`} onClick={()=>{setRepo(p.path); setSelected(null); setActiveTimeline(null); timelineExplicitlySetRef.current=false; playSound('click')}}>{p.name}</button>
           ))}
           <button className="tab add" onClick={scanResolve} title="Scan DaVinci Resolve library and auto-create folders">+ Scan Resolve</button>
+          <button className="tab add" onClick={syncFromResolve} title="Snapshot the currently open Resolve project into this folder (safe, never switches projects)">⇅ Sync Resolve</button>
         </div>
         <span className="tabHint">Auto-creates ~/GetSyncd/&lt;Project&gt; — pick a tab to switch projects</span>
       </div>
@@ -379,9 +533,9 @@ export default function App() {
           <div className="h" style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>History {activeTimeline && <span style={{fontSize:'10px', background:'var(--orange-soft)', color:'var(--orange)', border:'1px solid var(--orange-border)', padding:'2px 6px', borderRadius:'999px'}}>{activeTimeline}</span>}</div>
           {timelines.length>1 && (
             <div style={{display:'flex', gap:'6px', flexWrap:'wrap', marginBottom:'10px'}}>
-              <button onClick={()=>setActiveTimeline(null)} style={{background: !activeTimeline?'var(--orange)':'transparent', color: !activeTimeline?'white':'var(--muted)', border:'1px solid '+(!activeTimeline?'var(--orange)':'var(--border)'), padding:'4px 8px', borderRadius:'999px', fontSize:'11px', cursor:'pointer'}}>All</button>
-              {timelines.map((t:any)=>(
-                <button key={t.name} onClick={()=>{setActiveTimeline(t.name); playSound('click')}} style={{background: activeTimeline===t.name?'var(--orange)':'transparent', color: activeTimeline===t.name?'white': t.has_changes?'var(--orange)':'var(--muted)', border:'1px solid '+(activeTimeline===t.name?'var(--orange)': t.has_changes?'var(--orange-border)':'var(--border)'), padding:'4px 8px', borderRadius:'999px', fontSize:'11px', cursor:'pointer', opacity: t.has_changes?1:0.8}}>{t.name} {t.has_changes?'•':''}</button>
+              <button onClick={()=>{setActiveTimeline(null); timelineExplicitlySetRef.current=true; playSound('click')}} style={{background: !activeTimeline?'var(--orange)':'transparent', color: !activeTimeline?'white':'var(--muted)', border:'1px solid '+(!activeTimeline?'var(--orange)':'var(--border)'), padding:'4px 8px', borderRadius:'999px', fontSize:'11px', cursor:'pointer'}}>All</button>
+              {timelines.map((t)=>(
+                <button key={t.name} onClick={()=>{setActiveTimeline(t.name); timelineExplicitlySetRef.current=true; playSound('click')}} style={{background: activeTimeline===t.name?'var(--orange)':'transparent', color: activeTimeline===t.name?'white': t.has_changes?'var(--orange)':'var(--muted)', border:'1px solid '+(activeTimeline===t.name?'var(--orange)': t.has_changes?'var(--orange-border)':'var(--border)'), padding:'4px 8px', borderRadius:'999px', fontSize:'11px', cursor:'pointer', opacity: t.has_changes?1:0.8}}>{t.name} {t.has_changes?'•':''}</button>
               ))}
             </div>
           )}
@@ -403,10 +557,10 @@ export default function App() {
   </svg>
 </div>
                   <div className="meta">
-                    <div className="msg" style={{display:'flex', gap:'6px', alignItems:'center'}}><span style={{flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}>{v.message}</span>{!activeTimeline && (v as any).timeline && (v as any).timeline!=='timeline' ? <span style={{background:'var(--panel)', border:'1px solid var(--border)', color:'var(--muted)', padding:'1px 5px', borderRadius:'999px', fontSize:'10px', flexShrink:0}}>{(v as any).timeline}</span> : null}</div>
-                    <div className="sub">{v.date} • {v.short} {!activeTimeline && (v as any).timeline && (v as any).timeline!=='timeline' ? `• ${(v as any).timeline}` : ''}</div>
+                    <div className="msg" style={{display:'flex', gap:'6px', alignItems:'center'}}><span style={{flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}>{v.message}</span>{!activeTimeline && v.timeline && v.timeline!=='timeline' ? <span style={{background:'var(--panel)', border:'1px solid var(--border)', color:'var(--muted)', padding:'1px 5px', borderRadius:'999px', fontSize:'10px', flexShrink:0}}>{v.timeline}</span> : null}</div>
+                    <div className="sub">{v.date} • {v.short} {!activeTimeline && v.timeline && v.timeline!=='timeline' ? `• ${v.timeline}` : ''}</div>
                   </div>
-                  <button className="delBtn" title="Delete this version" onClick={(e)=>{e.stopPropagation(); doDelete(v)}}>×</button>
+                  <button className="delBtn" title="Delete this version" aria-label={`Delete version ${v.short} (${v.message})`} onClick={(e)=>{e.stopPropagation(); doDelete(v)}}>×</button>
                 </div>
               ))}
             </div>
@@ -427,8 +581,8 @@ export default function App() {
               </div>
               {diff && <div className="barWrap" style={{width:'100%'}}>
                 <div className="bar" style={{width:'100%', height:'36px'}}>
-                  {diff.new_track?.items?.slice(0,30).map((it:any,i:number)=>{
-                    const ch = diff.changes.find((c:any)=>c.index_new===i)
+                  {diff.new_track?.items?.slice(0,30).map((it,i:number)=>{
+                    const ch = diff.changes?.find(c=>c.index_new===i)
                     const cls = ch ? ch.type : 'unchanged'
                     return <div key={i} className={`clip ${cls}`} title={it.name} />
                   })}
@@ -441,16 +595,19 @@ export default function App() {
               </div>
               <div className="changes">
                 <h3>What changed</h3>
-                {diff?.changes?.length ? diff.changes.filter((c:any)=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap')).slice(0,10).map((c:any,i:number)=>(
+                {diff?.changes?.length ? (showAllChanges ? diff.changes.filter(c=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap')) : diff.changes.filter(c=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap')).slice(0,10)).map((c,i:number)=>(
                   <div key={i} className={`change ${c.type}`}><span className="dot2" /> <span>{humanChange(c)}</span></div>
                 )) : <div className="muted">No clip changes — maybe just a gap or timing tweak</div>}
+                {diff?.changes && diff.changes.filter(c=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap')).length > 10 && (
+                  <button className="ghost" style={{marginTop:'8px'}} onClick={()=>setShowAllChanges(v=>!v)}>{showAllChanges ? 'Show less' : `Show all ${diff.changes.filter(c=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap')).length} changes`}</button>
+                )}
                 {diff && (
                   <div className="notes">
-                    {diff.changes.filter((c:any)=> c.clip_name?.startsWith('Gap')).length>0 && (
-                      <div className="note gap-note">• {diff.changes.filter((c:any)=>c.clip_name?.startsWith('Gap')).length} gap{diff.changes.filter((c:any)=>c.clip_name?.startsWith('Gap')).length>1?'s':''} tweaked — usually just spacing, safe to ignore</div>
+                    {(diff.changes?.filter(c=> c.clip_name?.startsWith('Gap')).length || 0)>0 && (
+                      <div className="note gap-note">• {diff.changes?.filter(c=>c.clip_name?.startsWith('Gap')).length} gap{(diff.changes?.filter(c=>c.clip_name?.startsWith('Gap')).length || 0)>1?'s':''} tweaked — usually just spacing, safe to ignore</div>
                     )}
                     {diff?.warnings?.length ? (
-                      <div className="note warn-note">⚠ {diff.warnings.map((w:string)=> w.replace("Track list changed:", "Tracks:").replace("auto-merge not safe", "check tracks manually")).join(' • ')}</div>
+                      <div className="note warn-note">⚠ {diff.warnings.map((w:string)=> humanizeWarning(w)).join(' • ')}</div>
                     ) : null}
                   </div>
                 )}
@@ -466,12 +623,12 @@ export default function App() {
           <div className="h" style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>Git graph <span style={{fontSize:'10px', color:'var(--muted2)', fontWeight:500}}>{graph?.current || status?.current_branch || 'main'} • {graph?.commits?.length||log.length} saves</span></div>
           {(() => {
             const ROW = 80
-            const commits = graph?.commits?.length ? graph.commits : log.map((v:any, i:number)=> ({...v, lane:0, isBranch:false, isFork:false, isCurrent: i===0 && v.hash===log[0]?.hash}))
+            const commits: GraphCommit[] = graph?.commits?.length ? graph.commits : log.map((v, i:number)=> ({...v, lane:0, isBranch:false, isFork:false, isCurrent: i===0 && v.hash===log[0]?.hash}))
             const forkHash = graph?.fork
             const altBranch = graph?.altBranch
             // Find fork index
-            const forkIdx = forkHash ? commits.findIndex((c:any)=> c.hash===forkHash || c.short===forkHash?.slice(0,8)) : -1
-            const hasBranch = altBranch && commits.some((c:any)=>c.isBranch)
+            const forkIdx = forkHash ? commits.findIndex(c=> c.hash===forkHash || c.short===forkHash?.slice(0,8)) : -1
+            const hasBranch = altBranch && commits.some(c=>c.isBranch)
             const svgH = Math.max(commits.length * ROW, 200)
             const mainX = 24
             const branchX = 56
@@ -481,10 +638,10 @@ export default function App() {
                 <svg width="80" height={svgH} style={{position:'absolute', left:0, top:0, pointerEvents:'none'}}>
                   {/* Main lane */}
                   <line x1={mainX} y1={ROW/2} x2={mainX} y2={svgH - ROW/2} stroke="var(--border2)" strokeWidth={1.25} />
-                  {/* Branch lane + S-curve */}
-                  {hasBranch && forkIdx >=0 && (
-                    <>
-                      <line x1={branchX} y1={(forkIdx+1)*ROW + 12} x2={branchX} y2={(commits.findIndex((c:any)=>c.isBranch) !== -1 ? commits.findIndex((c:any)=>c.isBranch) : forkIdx+1)*ROW + ROW/2} stroke="var(--orange)" strokeWidth={1.25} opacity={0.6} />
+                    {/* Branch lane + S-curve */}
+                    {hasBranch && forkIdx >=0 && (
+                      <>
+                        <line x1={branchX} y1={(forkIdx+1)*ROW + 12} x2={branchX} y2={(commits.findIndex(c=>c.isBranch) !== -1 ? commits.findIndex(c=>c.isBranch) : forkIdx+1)*ROW + ROW/2} stroke="var(--orange)" strokeWidth={1.25} opacity={0.6} />
                       {(() => {
                         const y1 = forkIdx*ROW + ROW/2
                         const y2 = (forkIdx+1)*ROW + 20
@@ -493,7 +650,7 @@ export default function App() {
                       })()}
                     </>
                   )}
-                  {commits.map((c:any, i:number)=>{
+                  {commits.map((c, i:number)=>{
                     const y = i*ROW + ROW/2
                     const isFork = !!c.isFork
                     const isBranch = !!c.isBranch
@@ -529,7 +686,7 @@ export default function App() {
                   })}
                 </svg>
                 <div style={{marginLeft:'80px'}}>
-                  {commits.map((c:any)=>{
+                  {commits.map((c)=>{
                     const isSelected = !!selectedHash && c.hash===selectedHash
                     const isBranch = !!c.isBranch
                     const isCurrentBranchHead = !!c.isCurrent
@@ -617,7 +774,7 @@ export default function App() {
           </div>
         </div>
       )}
-      {showDeleteBranch && (
+      {showDeleteBranch && !pendingForceDelete && (
         <div className="modalBg" onClick={()=>setShowDeleteBranch(null)}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
             <h3>Delete branch “{showDeleteBranch}”?</h3>
@@ -632,16 +789,46 @@ export default function App() {
                 playSound('delete')
                 const r = await fetch(`${API}/api/branch/delete`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, name:b, force:false})}).then(r=>r.json())
                 if (!r.ok) {
-                  if (r.error.includes('not fully merged')) {
-                    setSyncStep(r.error)
-                    if (!confirm(`Branch "${b}" not fully merged — force delete and orphan commits?`)) { setSyncStep(null); return }
-                    const r2 = await fetch(`${API}/api/branch/delete`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, name:b, force:true})}).then(r=>r.json())
-                    if (!r2.ok) { alert(r2.error); setSyncStep(null); return }
-                  } else { alert(r.error); setSyncStep(null); return }
+                  if (typeof r.error === 'string' && r.error.includes('not fully merged')) {
+                    setSyncStep(null)
+                    setPendingForceDelete(b)
+                    return
+                  } else { showInfo('Delete branch failed', r.error, 'error'); setSyncStep(null); return }
                 }
                 showToast(`Deleted branch ${b}`, 'success')
                 refresh()
               }}>Delete branch</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {pendingForceDelete && (
+        <div className="modalBg" onClick={()=>setPendingForceDelete(null)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <h3>Force delete “{pendingForceDelete}”?</h3>
+            <p className="muted">Branch “{pendingForceDelete}” is not fully merged — force delete will orphan its commits. This cannot be undone without <code>git reflog</code>.</p>
+            <div className="modalActions">
+              <button onClick={()=>setPendingForceDelete(null)}>Go back</button>
+              <button className="primary" style={{background:'var(--red)', borderColor:'var(--red)'}} onClick={async()=>{
+                const b = pendingForceDelete
+                setPendingForceDelete(null)
+                playSound('delete')
+                const r2 = await fetch(`${API}/api/branch/delete`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, name:b, force:true})}).then(r=>r.json())
+                if (!r2.ok) { showInfo('Force delete failed', r2.error, 'error'); setSyncStep(null); return }
+                showToast(`Deleted branch ${b}`, 'success')
+                refresh()
+              }}>Force delete</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {infoModal && (
+        <div className="modalBg" onClick={()=>setInfoModal(null)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <h3>{infoModal.title}</h3>
+            <p className="muted" style={{whiteSpace:'pre-wrap'}}>{infoModal.body}</p>
+            <div className="modalActions">
+              <button className="primary" onClick={()=>setInfoModal(null)}>OK</button>
             </div>
           </div>
         </div>
@@ -652,9 +839,9 @@ export default function App() {
             <h3>Timelines — {activeTimeline || 'All'}</h3>
             <p className="muted">You’re working on <b style={{color:'var(--text)'}}>{status?.current_timeline || activeTimeline || 'timeline'}</b> in Resolve. Pick which timeline’s history to show.</p>
             <div style={{display:'flex', flexDirection:'column', gap:'8px', marginTop:'14px', maxHeight:'280px', overflow:'auto'}}>
-              <button onClick={()=>{setActiveTimeline(null); setShowTimelinePicker(false); playSound('click')}} style={{textAlign:'left', padding:'10px 12px', borderRadius:'var(--radius-card)', border: !activeTimeline?'1px solid var(--orange)':'1px solid var(--border)', background: !activeTimeline?'var(--orange-soft)':'var(--panel2)', color: !activeTimeline?'var(--orange)':'var(--text)', fontWeight: !activeTimeline?700:500, cursor:'pointer'}}>All timelines • {timelines.length} total</button>
-              {timelines.map((t:any)=>(
-                <button key={t.name} onClick={()=>{setActiveTimeline(t.name); setShowTimelinePicker(false); playSound('click')}} style={{textAlign:'left', padding:'10px 12px', borderRadius:'var(--radius-card)', border: activeTimeline===t.name?'1px solid var(--orange)':'1px solid var(--border)', background: activeTimeline===t.name?'var(--orange-soft)': t.has_changes?'var(--yellow-soft)':'var(--panel2)', color: activeTimeline===t.name?'var(--orange)': t.has_changes?'var(--yellow)':'var(--text)', display:'flex', justifyContent:'space-between', alignItems:'center', cursor:'pointer'}}>
+              <button onClick={()=>{setActiveTimeline(null); timelineExplicitlySetRef.current=true; setShowTimelinePicker(false); playSound('click')}} style={{textAlign:'left', padding:'10px 12px', borderRadius:'var(--radius-card)', border: !activeTimeline?'1px solid var(--orange)':'1px solid var(--border)', background: !activeTimeline?'var(--orange-soft)':'var(--panel2)', color: !activeTimeline?'var(--orange)':'var(--text)', fontWeight: !activeTimeline?700:500, cursor:'pointer'}}>All timelines • {timelines.length} total</button>
+              {timelines.map((t)=>(
+                <button key={t.name} onClick={()=>{setActiveTimeline(t.name); timelineExplicitlySetRef.current=true; setShowTimelinePicker(false); playSound('click')}} style={{textAlign:'left', padding:'10px 12px', borderRadius:'var(--radius-card)', border: activeTimeline===t.name?'1px solid var(--orange)':'1px solid var(--border)', background: activeTimeline===t.name?'var(--orange-soft)': t.has_changes?'var(--yellow-soft)':'var(--panel2)', color: activeTimeline===t.name?'var(--orange)': t.has_changes?'var(--yellow)':'var(--text)', display:'flex', justifyContent:'space-between', alignItems:'center', cursor:'pointer'}}>
                   <span style={{fontWeight: activeTimeline===t.name?700:500}}>{t.name} {t.name===status?.current_timeline?'• current':''}</span>
                   <span style={{fontSize:'11px', color: t.has_changes?'var(--orange)':'var(--muted)', background: t.has_changes?'var(--orange-soft)':'transparent', padding: t.has_changes?'2px 6px':'0', borderRadius:'999px'}}>{t.has_changes ? '• unsaved' : t.message?.includes('Not yet') ? 'not exported' : 'up to date'}</span>
                 </button>

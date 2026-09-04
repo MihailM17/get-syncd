@@ -96,7 +96,12 @@ const DATA = __DATA_JSON__;
 document.getElementById('revLabel').textContent = DATA.rev_a + ' → ' + DATA.rev_b;
 document.getElementById('runtimeLabel').textContent = DATA.summary.old_duration_s + 's → ' + DATA.summary.new_duration_s + 's (Δ ' + (DATA.summary.runtime_delta_s>0?'+':'') + DATA.summary.runtime_delta_s + 's)';
 const summary = document.getElementById('summary');
-function card(label, value){ const d=document.createElement('div'); d.className='card'; d.innerHTML='<small>'+label+'</small><br><b>'+value+'</b>'; return d; }
+// XSS-safe helpers: never use innerHTML with OTIO-derived strings (clip/track
+// names and URLs come from project files and may contain markup).
+function el(tag, cls, text){ const e=document.createElement(tag); if(cls) e.className=cls; if(text!==undefined&&text!==null) e.textContent=String(text); return e; }
+const SAFE_TYPES = new Set(['added','removed','trimmed','reordered','renamed','gap_changed','transition_changed','gap','transition','stack','clip','unknown']);
+function safeType(t){ return SAFE_TYPES.has(t) ? t : 'unknown'; }
+function card(label, value){ const d=document.createElement('div'); d.className='card'; d.appendChild(el('small','',label)); d.appendChild(document.createElement('br')); d.appendChild(el('b','',value)); return d; }
 summary.appendChild(card('Added', DATA.summary.added||0));
 summary.appendChild(card('Removed', DATA.summary.removed||0));
 summary.appendChild(card('Trimmed', DATA.summary.trimmed||0));
@@ -115,7 +120,7 @@ if(DATA.new_track && DATA.new_track.items){
     const div=document.createElement('div');
     let cls='clip';
     if(ch){
-      cls+=' '+ch.type;
+      cls+=' '+safeType(ch.type);
     }
     div.className=cls;
     // Width proportional to duration (clamped)
@@ -123,37 +128,48 @@ if(DATA.new_track && DATA.new_track.items){
     const w = Math.max(60, Math.min(200, dur/6));
     div.style.width=w+'px';
     div.title = (item.name||'(unnamed)') + ' — ' + (item.url||item.kind) + ' — ' + (item.duration_frames/NORMALIZED_RATE).toFixed(2)+'s' + (ch? ' — '+ch.type:'');
-    div.innerHTML = '<b>'+(item.name||item.kind)+'</b><small>'+(item.url? item.url.split('/').pop() : item.kind)+'</small>';
+    div.appendChild(el('b','',item.name||item.kind));
+    div.appendChild(el('small','',item.url ? item.url.split('/').pop() : item.kind));
     bar.appendChild(div);
   });
 } else {
   bar.textContent='(no track data)';
 }
 
-// Changes list
+// Changes list (all user-derived strings via textContent — never innerHTML)
 const list=document.getElementById('changes');
 DATA.changes.forEach(ch=>{
   const div=document.createElement('div');
-  div.className='change '+ch.type;
+  div.className='change '+safeType(ch.type);
   let icon='+';
   if(ch.type==='removed') icon='−';
   else if(ch.type==='trimmed') icon='~';
   else if(ch.type==='reordered') icon='↔';
   else if(ch.type==='renamed') icon='✎';
+  const d = ch.details || {};
   let detail='';
-  if(ch.type==='trimmed') detail= 'trimmed '+(ch.details.delta_s||0)+'s ('+ch.details.old_duration_s+'s → '+ch.details.new_duration_s+'s)';
-  else if(ch.type==='added') detail='added ('+(ch.details.duration_s||'?')+'s)';
+  if(ch.type==='trimmed') detail= 'trimmed '+(d.delta_s||0)+'s ('+d.old_duration_s+'s → '+d.new_duration_s+'s)';
+  else if(ch.type==='added') detail='added ('+(d.duration_s||'?')+'s)';
   else if(ch.type==='removed') detail='removed';
   else if(ch.type==='reordered') detail='moved ['+ch.index_old+'→'+ch.index_new+']';
-  else if(ch.type==='renamed') detail='renamed '+ch.details.renamed_from+' → '+ch.details.renamed_to;
+  else if(ch.type==='renamed') detail='renamed '+d.renamed_from+' → '+d.renamed_to;
   else detail=ch.type;
-  div.innerHTML='<span style="font-weight:700">'+icon+'</span><span><b>'+(ch.clip_name||'(unnamed)')+'</b> <small style="color:var(--muted)">'+(ch.url||ch.kind)+'</small><br><small>'+detail+'</small></span>';
+  const iconSpan=document.createElement('span'); iconSpan.style.fontWeight='700'; iconSpan.textContent=icon;
+  const body=document.createElement('span');
+  body.appendChild(el('b','',ch.clip_name||'(unnamed)'));
+  body.appendChild(document.createTextNode(' '));
+  const urlSmall=document.createElement('small'); urlSmall.style.color='var(--muted)'; urlSmall.textContent=(ch.url||ch.kind||'');
+  body.appendChild(urlSmall);
+  body.appendChild(document.createElement('br'));
+  body.appendChild(el('small','',detail));
+  div.appendChild(iconSpan); div.appendChild(body);
   list.appendChild(div);
 });
-if(DATA.changes.length===0) list.innerHTML='<div style="color:var(--muted)">No clip-level changes — timelines identical on compared track.</div>';
+if(DATA.changes.length===0){ const empty=document.createElement('div'); empty.style.color='var(--muted)'; empty.textContent='No clip-level changes — timelines identical on compared track.'; list.appendChild(empty); }
 document.getElementById('textlog').textContent = DATA.text_log || '';
 if(DATA.warnings && DATA.warnings.length){
-  document.getElementById('warnings').innerHTML = '⚠ ' + DATA.warnings.join('<br>⚠ ');
+  const warnBox=document.getElementById('warnings');
+  DATA.warnings.forEach((w,i)=>{ const line=document.createElement('div'); line.textContent='⚠ '+w; warnBox.appendChild(line); });
 }
 </script>
 </body>
@@ -231,7 +247,9 @@ class ViewerHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path in ("/", "/index.html"):
-            data_json = json.dumps(self.viewer_data)
+            # Escape script-breakout sequences: clip/track names are attacker-
+            # controlled and embedded inside a <script> block.
+            data_json = json.dumps(self.viewer_data).replace("</", "<\\/").replace("<!--", "<\\!--")
             html = HTML_TEMPLATE.replace("__DATA_JSON__", data_json)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
