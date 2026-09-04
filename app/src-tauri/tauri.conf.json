@@ -37,7 +37,7 @@
       "icons/icon.ico"
     ],
     "resources": [],
-    "externalBin": [],
+    "externalBin": ["binaries/get-syncd-api"],
     "macOS": {
       "minimumSystemVersion": "10.15"
     },

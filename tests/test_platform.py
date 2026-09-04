@@ -40,3 +40,19 @@ def test_linux_paths(monkeypatch):
 def test_ensure_path_no_crash_without_resolve():
     # On machines without Resolve installed this must simply return False
     assert resolve_state.ensure_resolve_scripting_path() in (True, False)
+
+
+def test_github_status_shape():
+    d = api.api_github_status()
+    assert set(d) >= {"ok", "has_gh", "authed"}
+    assert isinstance(d["ok"], bool)
+
+
+def test_github_create_validates(tmp_path):
+    r = api.api_github_create(tmp_path, name="bad name!", private=True)
+    assert not r["ok"]
+    r2 = api.api_github_create(tmp_path, name="good-name_1.2", private=True)
+    # Either "not a git repo" (no gh side effects) or gh-missing — never a crash
+    assert not r2["ok"] and "error" in r2
+    r3 = api.api_github_create("/etc", name="x", private=True)
+    assert not r3["ok"]

@@ -5,3 +5,5 @@
 # Regenerable via `cargo tauri icon` (mobile-only icon sets; desktop app)
 /icons/android/
 /icons/ios/
+# PyInstaller sidecar binaries (per-OS, built by scripts/build-sidecar.sh or CI)
+/binaries/

@@ -15,6 +15,10 @@ Media stays on your drive. Only the timeline structure (clip order, trims, gaps)
 
 There's a CLI if you like the terminal, and a desktop app if you don't.
 
+### Download
+
+No Python, no Terminal needed: grab the installer for your OS from [**Releases**](https://github.com/MihailM17/get-syncd/releases) — `.dmg` (macOS), `.msi`/`.exe` (Windows), `.AppImage` (Linux). It bundles everything, starts its own background service, and opens with a first-run wizard that finds Resolve and sets up `~/GetSyncd` for you.
+
 ### See it in action
 
 ![Get Syncd GUI](assets/getsyncd-gui-example.png)
@@ -69,8 +73,10 @@ Then:
 ```bash
 source .venv/bin/activate  # Windows: .\.venv\Scripts\Activate.ps1
 get-syncd --help
-pytest -q  # 27 passed
+pytest -q  # 29 passed
 ```
+
+Step-by-step per OS: [MAC_GUIDE.md](MAC_GUIDE.md) · [WINDOWS_GUIDE.md](WINDOWS_GUIDE.md) · [LINUX_GUIDE.md](LINUX_GUIDE.md)
 
 ### Desktop app
 

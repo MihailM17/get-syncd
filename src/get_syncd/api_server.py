@@ -120,6 +120,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/resolve/current":
             self._json(core_api.api_get_current_resolve())
             return
+        if parsed.path == "/api/github/status":
+            self._json(core_api.api_github_status())
+            return
         if parsed.path == "/api/preview":
             h = qs.get("hash", [""])[0]
             if not h or not h.replace("-", "").replace("_", "").isalnum():
@@ -164,6 +167,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/resolve/sync":
             res = core_api.api_sync_resolve(repo)
+            self._json(res, status=200 if res.get("ok") else 400)
+            return
+        if parsed.path == "/api/github/create":
+            res = core_api.api_github_create(
+                repo,
+                name=str(data.get("name", "")),
+                private=bool(data.get("private", True)),
+                description=str(data.get("description", "")),
+            )
             self._json(res, status=200 if res.get("ok") else 400)
             return
         if parsed.path == "/api/save":

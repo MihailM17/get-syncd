@@ -33,6 +33,8 @@ export default function App() {
   const [activeTimeline, setActiveTimeline] = useState<string | null>(null)
   const [showTimelinePicker, setShowTimelinePicker] = useState(false)
   const [showAllChanges, setShowAllChanges] = useState(false)
+  const [wizardDismissed, setWizardDismissed] = useState(false)
+  const [projectsLoaded, setProjectsLoaded] = useState(false)
   const [infoModal, setInfoModal] = useState<{title:string, body:string} | null>(null)
   const [pendingForceDelete, setPendingForceDelete] = useState<string | null>(null)
   const [toast, setToast] = useState<{msg:string, type:'success'|'error'|'info'}|null>(null)
@@ -173,6 +175,7 @@ export default function App() {
       if (r.ok) {
         const projs = r.projects || []
         setProjects(projs)
+        setProjectsLoaded(true)
         // First load only: if still on container path, switch to first project (no N+1 log fan-out)
         if (!hasAutoSelectedRef.current && projs.length && (repoRef.current === '' || repoRef.current === defaultRepo)) {
           const first = projs[0]
@@ -446,6 +449,22 @@ export default function App() {
     else if (k===yest) k='Yesterday'
     groups[k] = groups[k] || []
     groups[k].push(v)
+  }
+
+  if (repoReady && projectsLoaded && projects.length===0 && !wizardDismissed) {
+    return (
+      <FirstRunWizard
+        defaultRepo={defaultRepo}
+        api={api}
+        notify={showInfo}
+        click={playSound}
+        onDismiss={()=>setWizardDismissed(true)}
+        onDone={(path)=>{
+          setRepo(path); setFolder(path); setShowSetup(false); setWizardDismissed(true)
+          refreshProjects(); refresh()
+        }}
+      />
+    )
   }
 
   if (showSetup) {
@@ -873,6 +892,178 @@ export default function App() {
         </div>
       )}
       {toast && <div className={`toast ${toast.type} show`}>{toast.msg}</div>}
+    </div>
+  )
+}
+
+function FirstRunWizard(props: {
+  defaultRepo: string
+  api: (path: string, opts?: RequestInit) => Promise<any>
+  notify: (title: string, body: string, type?: 'success'|'error'|'info') => void
+  click: (type?: 'click'|'success'|'delete'|'pop') => void
+  onDismiss: () => void
+  onDone: (path: string) => void
+}) {
+  const { defaultRepo, api, notify, click, onDismiss, onDone } = props
+  const [step, setStep] = useState(0)
+  const [resolveInfo, setResolveInfo] = useState<{project: string|null, current_timeline: string|null, timelines: string[]}|null>(null)
+  const [checking, setChecking] = useState(false)
+  const [projName, setProjName] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [createdPath, setCreatedPath] = useState<string|null>(null)
+  const [ghStatus, setGhStatus] = useState<{ok?:boolean; has_gh?:boolean; authed?:boolean; error?:string}|null>(null)
+  const [ghName, setGhName] = useState('')
+  const [ghPrivate, setGhPrivate] = useState(true)
+  const [ghUrl, setGhUrl] = useState<string|null>(null)
+
+  const checkResolve = async () => {
+    setChecking(true)
+    try {
+      const r = await fetch(`${API}/api/resolve/current`).then(x=>x.json())
+      setResolveInfo({project: r.project || null, current_timeline: r.current_timeline || null, timelines: r.timelines || []})
+      if (r.project && !projName) setProjName(r.project)
+    } catch {
+      setResolveInfo({project: null, current_timeline: null, timelines: []})
+    } finally {
+      setChecking(false)
+    }
+  }
+  useEffect(()=>{ checkResolve() }, [])
+
+  const loadGh = async () => {
+    try {
+      const r = await fetch(`${API}/api/github/status`).then(x=>x.json())
+      setGhStatus(r)
+    } catch {
+      setGhStatus({ok:false, has_gh:false, authed:false, error:'Could not reach the sidecar.'})
+    }
+  }
+  useEffect(()=>{ if (step===3) loadGh() }, [step])
+
+  const createProject = async () => {
+    const name = projName.trim()
+    if (!name) { notify('Name required', 'Give your project a name first.', 'error'); return }
+    setBusy(true)
+    try {
+      const target = `${defaultRepo}/${name}`
+      await api('/api/init', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: target})})
+      setCreatedPath(target)
+      if (!ghName) setGhName(name)
+      click('success')
+      setStep(3)
+    } catch (e) {
+      notify('Create failed', e instanceof Error ? e.message : 'Could not create project.', 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const createGithub = async () => {
+    if (!createdPath) return
+    setBusy(true)
+    try {
+      const r = await api('/api/github/create', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: createdPath, name: ghName.trim(), private: ghPrivate})}) as {ok?:boolean; url?:string}
+      if (r.url) setGhUrl(r.url)
+      click('success')
+    } catch (e) {
+      notify('GitHub create failed', e instanceof Error ? e.message : 'Could not create repo.', 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const go = (n:number) => { click('click'); setStep(n) }
+  const targetPreview = projName.trim() ? `${defaultRepo}/${projName.trim()}` : `${defaultRepo}/MyProject`
+
+  return (
+    <div className="setup">
+      <h1>Get Syncd</h1>
+      <div className="card" style={{maxWidth:'520px'}}>
+        <div className="muted" style={{fontSize:'12px', marginBottom:'12px'}}>Step {step+1} of 5 {createdPath ? `• ${createdPath}` : ''}</div>
+        {step===0 && (
+          <>
+            <h3>Version control for your edits</h3>
+            <p className="muted">Every save is a checkpoint of your timeline — see what changed in plain English and jump back to any cut. Your <b style={{color:'var(--text)'}}>media never leaves this computer</b>; only the tiny timeline file is versioned.</p>
+            <div className="modalActions">
+              <button className="ghost" onClick={()=>{click('click'); onDismiss()}}>Skip setup</button>
+              <button className="primary big" onClick={()=>go(1)}>Get started</button>
+            </div>
+          </>
+        )}
+        {step===1 && (
+          <>
+            <h3>Find DaVinci Resolve</h3>
+            {checking && <p className="muted">Checking for a running Resolve…</p>}
+            {!checking && resolveInfo?.project && (
+              <p>Found project <b style={{color:'var(--text)'}}>{resolveInfo.project}</b>{resolveInfo.current_timeline ? ` • timeline ${resolveInfo.current_timeline}` : ''} ({resolveInfo.timelines.length} timeline{resolveInfo.timelines.length===1?'':'s'}).</p>
+            )}
+            {!checking && !resolveInfo?.project && (
+              <p className="muted">Resolve isn't reachable. Open Resolve with a project, enable Preferences → System → General → External scripting, then check again. You can also continue without it.</p>
+            )}
+            <div className="modalActions">
+              <button className="ghost" onClick={()=>go(0)}>Back</button>
+              <button className="ghost" onClick={()=>{checkResolve()}}>Check again</button>
+              <button className="primary" onClick={()=>go(2)}>Continue</button>
+            </div>
+          </>
+        )}
+        {step===2 && (
+          <>
+            <h3>Create your first project</h3>
+            <p className="muted">This creates a folder with its own git history.</p>
+            <label>Project name:</label>
+            <div className="row">
+              <input value={projName} onChange={e=>setProjName(e.target.value)} placeholder={resolveInfo?.project || 'MyProject'} onKeyDown={e=>{if(e.key==='Enter') createProject()}} />
+            </div>
+            <p className="muted" style={{fontSize:'12px'}}>Folder: <code>{targetPreview}</code></p>
+            <div className="modalActions">
+              <button className="ghost" onClick={()=>go(1)}>Back</button>
+              <button className="primary" disabled={busy} onClick={createProject}>{busy ? 'Creating…' : 'Create project'}</button>
+            </div>
+          </>
+        )}
+        {step===3 && (
+          <>
+            <h3>Back up to GitHub? (optional)</h3>
+            {!ghStatus && <p className="muted">Checking GitHub CLI…</p>}
+            {ghStatus && (!ghStatus.has_gh || !ghStatus.authed) && (
+              <p className="muted">{ghStatus.error} You can do this later with <code>gh auth login</code> — local saves work fully offline either way.</p>
+            )}
+            {ghStatus?.ok && !ghUrl && (
+              <>
+                <label>Repository name:</label>
+                <div className="row">
+                  <input value={ghName} onChange={e=>setGhName(e.target.value)} placeholder="my-film" />
+                </div>
+                <label style={{display:'flex', gap:'8px', alignItems:'center', marginTop:'8px'}}>
+                  <input type="checkbox" checked={ghPrivate} onChange={e=>setGhPrivate(e.target.checked)} /> Private repository
+                </label>
+              </>
+            )}
+            {ghUrl && <p>Created: <b style={{color:'var(--text)'}}>{ghUrl}</b> — pushed ✓</p>}
+            <div className="modalActions">
+              <button className="ghost" onClick={()=>go(2)}>Back</button>
+              {ghStatus?.ok && !ghUrl && <button className="primary" disabled={busy || !ghName.trim()} onClick={createGithub}>{busy ? 'Creating…' : 'Create & push'}</button>}
+              <button className={ghStatus?.ok && !ghUrl ? 'ghost' : 'primary'} onClick={()=>go(4)}>{ghUrl || !ghStatus?.ok ? 'Continue' : 'Skip'}</button>
+            </div>
+          </>
+        )}
+        {step===4 && (
+          <>
+            <h3>Where things live</h3>
+            <div className="detect">
+              <div>Project: <b>{createdPath || targetPreview}</b></div>
+              <div>Timeline: <b>auto-exported on every Save</b></div>
+              <div>Media: <b>stays local, never uploaded</b></div>
+              <p className="muted">Only the small timeline file is versioned. Media paths are absolute — if you move drives, relink in Resolve's Media Pool as usual.</p>
+            </div>
+            <div className="modalActions">
+              <button className="ghost" onClick={()=>go(3)}>Back</button>
+              <button className="primary big" onClick={()=>{click('success'); onDone(createdPath || targetPreview)}}>Open Get Syncd</button>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   )
 }

@@ -147,6 +147,99 @@ def api_init(repo: str | Path | None = None, remote: str | None = None) -> dict:
     git_store.init_repo(r, remote_url=remote)
     return {"ok": True, "repo": str(r), "remote": remote}
 
+
+def api_github_status() -> dict:
+    """Best-effort GitHub CLI check for the first-run wizard. Never raises."""
+    import shutil
+
+    gh = shutil.which("gh")
+    if not gh:
+        return {
+            "ok": False,
+            "has_gh": False,
+            "authed": False,
+            "error": "GitHub CLI (gh) not installed — see https://cli.github.com, or skip this step.",
+        }
+    try:
+        r = subprocess.run(
+            [gh, "auth", "status"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        if r.returncode == 0:
+            return {"ok": True, "has_gh": True, "authed": True}
+        return {
+            "ok": False,
+            "has_gh": True,
+            "authed": False,
+            "error": "gh is installed but not logged in — run `gh auth login`, or skip this step.",
+        }
+    except Exception as e:
+        log.warning("gh auth status failed: %s", e)
+        return {"ok": False, "has_gh": True, "authed": False, "error": f"Could not check gh auth: {e}"}
+
+
+def api_github_create(
+    repo: str | Path | None = None,
+    name: str = "",
+    private: bool = True,
+    description: str = "",
+) -> dict:
+    """Create a GitHub repo for a project and push (best-effort, via `gh`).
+
+    Requires the `gh` CLI installed and authed. Safe to call from the wizard;
+    failures return {ok: False} with a human message, never raise.
+    """
+    import re
+    import shutil
+
+    name = (name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", name):
+        return {"ok": False, "error": "Repo name may only contain letters, numbers, . _ - (max 100 chars)."}
+    try:
+        r = _resolve_repo(repo)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if not is_repo_allowed(r):
+        return {"ok": False, "error": "Repo outside ~/GetSyncd not allowed"}
+    if not git_store.is_git_repo(r):
+        return {"ok": False, "error": "Not a git repo yet — create the project first."}
+    gh = shutil.which("gh")
+    if not gh:
+        return {"ok": False, "error": "GitHub CLI (gh) not installed — see https://cli.github.com."}
+    args = [gh, "repo", "create", name, "--private" if private else "--public",
+            "--source", str(r), "--push"]
+    if description.strip():
+        args += ["--description", description.strip()[:350]]
+    try:
+        p = subprocess.run(
+            args,
+            cwd=str(r),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "gh timed out — check your network and retry."}
+    except Exception as e:
+        log.warning("gh repo create failed: %s", e)
+        return {"ok": False, "error": f"Could not run gh: {e}"}
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "unknown error").strip().splitlines()
+        return {"ok": False, "error": "; ".join(err[-3:])[:500]}
+    url = ""
+    for line in (p.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("https://github.com/"):
+            url = line
+            break
+    return {"ok": True, "repo": str(r), "name": name, "url": url, "private": private}
+
 def api_status(repo: str | Path | None = None) -> dict:
     r = _resolve_repo(repo)
     # Per-timeline status

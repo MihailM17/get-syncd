@@ -54,9 +54,12 @@ mkdir -p "$OUT_DIR"
 
 echo "→ Building $BIN_NAME for $TARGET..."
 WORKDIR="${TMPDIR:-/tmp}/pyinstaller_build"
+# NOTE: build via scripts/sidecar_entry.py (imports get_syncd as a package);
+# freezing api_server.py directly breaks its relative imports.
 pyinstaller --onefile --name "$BIN_NAME-$TARGET" --distpath "$OUT_DIR" --workpath "$WORKDIR" --specpath "$WORKDIR" --clean \
+  --paths "$REPO_DIR/src" \
   --hidden-import=opentimelineio --hidden-import=PIL --hidden-import=rich \
-  "$REPO_DIR/src/get_syncd/api_server.py" 2>&1 | tail -n 20
+  "$REPO_DIR/scripts/sidecar_entry.py" 2>&1 | tail -n 20
 
 chmod +x "$OUT_DIR/$BIN_NAME-$TARGET" 2>/dev/null || true
 echo "Sidecar built: $OUT_DIR/$BIN_NAME-$TARGET ($(du -h "$OUT_DIR/$BIN_NAME-$TARGET" | cut -f1))"
