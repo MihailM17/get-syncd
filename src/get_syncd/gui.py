@@ -32,6 +32,7 @@ from . import git_store
 from .otio_parse import parse_otio_file
 from .diff import diff_timelines, changelog_line
 from .preview import generate_preview, _preview_path, ensure_previews, HAS_PIL
+from .resolve_state import ensure_resolve_scripting_path
 
 # PIL ImageTk needed for display (separate from preview generation)
 try:
@@ -49,12 +50,7 @@ def _try_resolve_export(out_path: Path) -> tuple[bool, str]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     resolve = None
     try:
-        for p in [
-            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
-            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
-        ]:
-            if p not in sys.path and Path(p).exists():
-                sys.path.append(p)
+        ensure_resolve_scripting_path()
         import DaVinciResolveScript as bmd  # type: ignore
         resolve = bmd.scriptapp("Resolve")
     except Exception as e:

@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const API = 'http://127.0.0.1:5174'
-const DEFAULT_REPO = '/Users/mihailmihaylov/GetSyncd'
+// Projects folder comes from GET /api/default-repo at startup (OS-correct ~/GetSyncd).
+// Empty until resolved — the backend treats an empty repo as "use the default".
 const POLL_MS = 10000
 
 type Version = { hash: string; short: string; author: string; date: string; message: string; preview?: string; timeline?: string }
@@ -14,7 +15,9 @@ type DiffChange = { type: string; index_old?: number | null; index_new?: number 
 type Diff = { summary?: { added?: number; removed?: number; trimmed?: number; reordered?: number; gap_changed?: number; total_changes?: number; runtime_delta_s?: number }; changes?: DiffChange[]; warnings?: string[]; new_track?: { items?: { name?: string }[] } | null }
 
 export default function App() {
-  const [repo, setRepo] = useState(DEFAULT_REPO)
+  const [defaultRepo, setDefaultRepo] = useState('')
+  const [repoReady, setRepoReady] = useState(false)
+  const [repo, setRepo] = useState('')
   const [status, setStatus] = useState<Status | null>(null)
   const [log, setLog] = useState<Version[]>([])
   const [selected, setSelected] = useState<Version | null>(null)
@@ -23,7 +26,7 @@ export default function App() {
   const [showSave, setShowSave] = useState(false)
   const [showSetup, setShowSetup] = useState(false)
   const [syncStep, setSyncStep] = useState<string | null>(null)
-  const [folder, setFolder] = useState(DEFAULT_REPO)
+  const [folder, setFolder] = useState('')
   const [projects, setProjects] = useState<{name:string,path:string}[]>([])
   const [graph, setGraph] = useState<Graph | null>(null)
   const [timelines, setTimelines] = useState<TimelineInfo[]>([])
@@ -171,7 +174,7 @@ export default function App() {
         const projs = r.projects || []
         setProjects(projs)
         // First load only: if still on container path, switch to first project (no N+1 log fan-out)
-        if (!hasAutoSelectedRef.current && projs.length && repoRef.current === DEFAULT_REPO) {
+        if (!hasAutoSelectedRef.current && projs.length && (repoRef.current === '' || repoRef.current === defaultRepo)) {
           const first = projs[0]
           if (first && first.path !== repoRef.current) {
             setRepo(first.path)
@@ -235,7 +238,7 @@ export default function App() {
       const s = await api('/api/status', undefined, repoAtStart, signal) as Status
       // Guard against stale response after repo switch — strict per-project isolation
       if (repoAtStart !== repoRef.current) return
-      if (s.repo && s.repo !== repoAtStart) return
+      if (s.repo && repoAtStart && s.repo !== repoAtStart) return
       setStatus(s)
       if (!s.is_repo) { setShowSetup(true); return }
       setShowSetup(false)
@@ -263,7 +266,7 @@ export default function App() {
           if (repoAtStart !== repoRef.current) return
           if (t?.ok) {
             // Guard: t.repo should match repoAtStart if present
-            if (t.repo && t.repo !== repoAtStart) return
+            if (t.repo && repoAtStart && t.repo !== repoAtStart) return
             setTimelines(t.timelines || [])
             if (t.current && !effTimeline) {
               effTimeline = t.current
@@ -300,7 +303,22 @@ export default function App() {
     }
   }
 
+  // Resolve OS-correct ~/GetSyncd once at startup (replaces hardcoded fallback path)
   useEffect(() => {
+    let cancelled = false
+    fetch(`${API}/api/default-repo`).then(r=>r.json()).then((d:{ok?:boolean; path?:string})=>{
+      if (cancelled) return
+      if (d?.ok && d.path) {
+        setDefaultRepo(d.path)
+        setRepo(prev => (prev === '' ? d.path as string : prev))
+        setFolder(prev => (prev === '' ? d.path as string : prev))
+      }
+    }).catch(()=>{}).finally(()=>{ if (!cancelled) setRepoReady(true) })
+    return ()=>{ cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    if (!repoReady) return
     // Clear stale per-project state immediately on repo switch — prevents flash of old timelines/commits
     setTimelines([])
     setLog([])
@@ -312,7 +330,7 @@ export default function App() {
     refreshProjects(ctl.signal); refresh(ctl.signal)
     const id = window.setInterval(()=>{ refreshProjects(ctl.signal); refresh(ctl.signal) }, POLL_MS)
     return ()=>{ ctl.abort(); window.clearInterval(id) }
-  }, [repo, activeTimeline])
+  }, [repoReady, repo, activeTimeline])
   useEffect(() => {
     if (!selected || log.length<2) return
     const ctl = new AbortController()
@@ -438,7 +456,7 @@ export default function App() {
           <label>Project folder:</label>
           <div className="row">
             <input value={folder} onChange={e=>setFolder(e.target.value)} placeholder="~/GetSyncd" />
-            <button onClick={()=>setFolder(DEFAULT_REPO)}>Select Folder</button>
+            <button onClick={()=>setFolder(defaultRepo)}>Select Folder</button>
           </div>
           <div className="detect">
             <div>Detected:</div>

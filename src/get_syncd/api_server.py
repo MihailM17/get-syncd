@@ -111,6 +111,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/projects":
             self._json(core_api.api_list_projects())
             return
+        if parsed.path == "/api/default-repo":
+            self._json(core_api.api_default_repo())
+            return
         if parsed.path == "/api/resolve/projects":
             self._json(core_api.api_scan_resolve_projects())
             return

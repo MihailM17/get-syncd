@@ -23,6 +23,7 @@ from .resolve_state import (
     _read_current_resolve_state,
     _save_known_timelines,
     _known_timelines_file,
+    ensure_resolve_scripting_path,
 )
 from .timeline_files import _sanitize_timeline_name, _list_timeline_files
 import logging
@@ -849,6 +850,15 @@ def api_delete(repo: str | Path | None = None, rev: str = "", timeline: str | No
     except Exception as e:
         return {"ok": False, "error": str(e), "repo": str(r)}
 
+def api_default_repo() -> dict:
+    """OS-correct default projects folder (~/GetSyncd). Lets the frontend avoid hardcoding paths."""
+    try:
+        DEFAULT_REPO.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log.warning("default repo mkdir failed: %s", e)
+    return {"ok": True, "path": str(DEFAULT_REPO.resolve() if DEFAULT_REPO.exists() else DEFAULT_REPO)}
+
+
 def api_list_projects() -> dict:
     """List all Get Syncd projects (subfolders of ~/GetSyncd that are git repos)."""
     base = DEFAULT_REPO
@@ -870,12 +880,7 @@ def api_scan_resolve_projects() -> dict:
     base.mkdir(parents=True, exist_ok=True)
     resolve = None
     try:
-        for pp in [
-            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
-            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
-        ]:
-            if pp not in __import__("sys").path and Path(pp).exists():
-                __import__("sys").path.append(pp)
+        ensure_resolve_scripting_path()
         import DaVinciResolveScript as bmd  # type: ignore
         resolve = bmd.scriptapp("Resolve")
     except Exception as e:
@@ -944,12 +949,7 @@ def _try_resolve_export(out_path: Path) -> tuple[bool, str]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     resolve = None
     try:
-        for pp in [
-            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
-            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
-        ]:
-            if pp not in __import__("sys").path and Path(pp).exists():
-                __import__("sys").path.append(pp)
+        ensure_resolve_scripting_path()
         import DaVinciResolveScript as bmd  # type: ignore
         resolve = bmd.scriptapp("Resolve")
     except Exception as e:
@@ -1034,12 +1034,7 @@ def _try_resolve_import(otio_path: Path) -> tuple[bool, str]:
         return False, f"File not found: {otio_path}"
     resolve = None
     try:
-        for pp in [
-            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
-            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
-        ]:
-            if pp not in __import__("sys").path and Path(pp).exists():
-                __import__("sys").path.append(pp)
+        ensure_resolve_scripting_path()
         import DaVinciResolveScript as bmd  # type: ignore
         resolve = bmd.scriptapp("Resolve")
     except Exception as e:

@@ -2,3 +2,6 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+# Regenerable via `cargo tauri icon` (mobile-only icon sets; desktop app)
+/icons/android/
+/icons/ios/

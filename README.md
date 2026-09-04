@@ -3,11 +3,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-lightgrey.svg)](https://developer.apple.com/macos/)
+[![Windows](https://img.shields.io/badge/Windows-10%2B-blue.svg)](https://www.microsoft.com/windows)
+[![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://www.kernel.org/)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-18.5%2B-orange.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
 
 Version control for DaVinci Resolve timelines. No more `MyFilm_v3_FINAL_FINAL.drp`.
 
-You export your timeline as OTIO, hit save, and you can see what actually changed between any two versions — "trimmed 2 clips, added 1, runtime +1.2s" — then jump back to any old cut without digging through old project files.
+Hit Save and you can see what actually changed between any two versions — "trimmed 2 clips, added 1, runtime +1.2s" — then jump back to any old cut without digging through old project files. The desktop app auto-exports the current timeline from Resolve via the scripting API, so there's usually no manual export step; if auto-export can't reach Resolve, fall back to `File → Export Timeline → OpenTimelineIO`.
 
 Media stays on your drive. Only the timeline structure (clip order, trims, gaps) goes into git, so it's tiny and works fine on the free GitHub plan. Works with Resolve Free — you don't need Studio.
 
@@ -32,9 +34,9 @@ There's a CLI if you like the terminal, and a desktop app if you don't.
 
 ### How it works
 
-`Resolve` → `File → Export Timeline → OpenTimelineIO` → `timeline.otio` → `get-syncd save` → git commit → (optional) push to GitHub.
+`Save button` → auto-export current timeline from Resolve → `timeline.otio` → git commit → (optional) push to GitHub. (Manual fallback: `File → Export Timeline → OpenTimelineIO`.)
 
-Restoring just writes an `.otio` you re-import in Resolve. That part is manual — the Resolve API can't reliably lay out clips for you, so `Import Timeline` is still the safest way.
+Restoring writes the old `.otio` back and auto-imports it into the open Resolve project when the scripting API allows it; otherwise it tells you the manual `File → Import Timeline → OpenTimelineIO` steps.
 
 ### Quick start
 
@@ -54,13 +56,20 @@ get-syncd restore HEAD~1 --out /tmp/old.otio
 
 ### Install
 
-Python 3.10+ and `opentimelineio`:
+Pick your OS (Python 3.10+, git required):
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+./install-mac.sh        # macOS
+./install-linux.sh      # Linux (apt/dnf/pacman)
+.\install-windows.ps1   # Windows (PowerShell; needs Python + git on PATH)
+```
+
+Then:
+
+```bash
+source .venv/bin/activate  # Windows: .\.venv\Scripts\Activate.ps1
 get-syncd --help
+pytest -q  # 27 passed
 ```
 
 ### Desktop app
@@ -71,10 +80,10 @@ If you prefer clicking:
 get-syncd gui          # Tk sidecar — simple, stays next to Resolve
 # or the Tauri build:
 cd app && npm install && npm run tauri:dev   # dev
-# or just open /Applications/Get\ Syncd.app after a release build
+npm run tauri:build    # release bundle for your OS (.app / .exe / .AppImage)
 ```
 
-The app watches `~/GetSyncd` by default. Export from Resolve to `timeline.otio` in there, type a note, hit Save. History shows up on the left, preview + diff on the right. Branches, restore, delete, and Scan Resolve to auto-create project folders.
+Ready-made bundles for all three OSes are built by CI (`.github/workflows/build.yml`) on every push to `master`. The app watches `~/GetSyncd` by default (resolved per-OS, never hardcoded). Hit Save — it auto-exports the current Resolve timeline — type a note, done. History shows up on the left, preview + diff on the right. Branches, restore, delete, Scan Resolve to auto-create project folders, and Sync Resolve to snapshot the open project's timeline list.
 
 ### Why OTIO + git?
 
@@ -84,8 +93,9 @@ The app watches `~/GetSyncd` by default. Export from Resolve to `timeline.otio` 
 
 ### Notes
 
-- Tested on macOS Apple Silicon, Resolve 18.5+ Free. Linux works for the CLI/diff engine without Resolve.
+- Primary dev happens on macOS Apple Silicon, Resolve 18.5+ Free — no Studio needed. Linux and Windows are supported: Resolve scripting paths are detected per-OS, and CI runs the test suite on all three.
+- The desktop Sync button is currently a status check only — real push is `git push` (or `get-syncd push`) to whatever remote you linked with `get-syncd init --remote` or `git remote add origin ...`.
 - Media paths are absolute — if you move drives, relink in Resolve's Media Pool like you normally would.
-- `get-syncd push` is just `git push` to whatever GitHub repo you linked with `get-syncd init --remote` or `git remote add origin ...`.
+- The local API listens on `http://127.0.0.1:5174` only and refuses repos outside `~/GetSyncd`.
 
 MIT — do what you want with it. Issues and small PRs welcome.

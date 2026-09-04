@@ -15,6 +15,55 @@ log = logging.getLogger(__name__)
 
 DEFAULT_REPO = Path.home() / "GetSyncd"
 
+
+def resolve_scripting_paths() -> list[str]:
+    """Candidate DaVinci Resolve scripting module dirs for the current OS.
+
+    macOS: /Library/... and ~/Library/...; Windows: %PROGRAMDATA% + %APPDATA%
+    variants; Linux: /opt/resolve/... plus XDG-ish fallbacks. Only existing
+    dirs are returned, in priority order.
+    """
+    import sys
+
+    candidates: list[str] = []
+    plat = sys.platform
+    if plat == "win32":
+        import os
+
+        program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        app_data = os.environ.get("APPDATA", "")
+        candidates.append(
+            str(Path(program_data) / "Blackmagic Design" / "DaVinci Resolve" / "Support" / "Developer" / "Scripting" / "Modules")
+        )
+        if app_data:
+            candidates.append(
+                str(Path(app_data) / "Blackmagic Design" / "DaVinci Resolve" / "Support" / "Developer" / "Scripting" / "Modules")
+            )
+    elif plat.startswith("linux"):
+        candidates.append("/opt/resolve/Developer/Scripting/Modules")
+        candidates.append("/opt/BlackmagicDesign/DaVinci_Resolve/Developer/Scripting/Modules")
+        candidates.append(
+            str(Path.home() / ".local" / "share" / "DaVinciResolve" / "Developer" / "Scripting" / "Modules")
+        )
+    else:  # macOS and anything else: keep historical behavior
+        candidates.append("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules")
+        candidates.append(
+            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules")
+        )
+    return [p for p in candidates if Path(p).exists()]
+
+
+def ensure_resolve_scripting_path() -> bool:
+    """Append existing Resolve scripting dirs to sys.path. Returns True if any added."""
+    import sys
+
+    added = False
+    for pp in resolve_scripting_paths():
+        if pp not in sys.path:
+            sys.path.append(pp)
+            added = True
+    return added
+
 _CURRENT_RESOLVE_CACHE: dict = {"t": 0.0, "project": None, "current": None, "names": []}
 _CURRENT_RESOLVE_TTL_S = 5.0
 
@@ -69,12 +118,7 @@ def _read_current_resolve_state() -> tuple[str | None, str | None, list[str]]:
         )
 
     try:
-        for pp in [
-            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
-            str(Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules"),
-        ]:
-            if pp not in __import__("sys").path and Path(pp).exists():
-                __import__("sys").path.append(pp)
+        ensure_resolve_scripting_path()
         import DaVinciResolveScript as bmd  # type: ignore
         resolve = bmd.scriptapp("Resolve")
         if not resolve:

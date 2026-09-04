@@ -1,6 +1,6 @@
 # Get Syncd on Mac — short version
 
-You don’t need to know git. If you can export a timeline in Resolve and type a line in Terminal, you’re good.
+You don’t need to know git. If you can export a timeline in Resolve and type a line in Terminal, you’re good. (On Linux run `./install-linux.sh`, on Windows `.\install-windows.ps1` — the loop below is the same everywhere.)
 
 ### The idea
 
@@ -90,7 +90,7 @@ You can test the diff engine with no video:
 ```bash
 cd ~/get-syncd
 source .venv/bin/activate
-pytest -q  # should say 9 passed
+pytest -q  # should say 27 passed
 ```
 
 ### If it complains
