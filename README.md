@@ -23,7 +23,7 @@ Grab the installer for your OS from [**Releases**](https://github.com/MihailM17/
 
 ![Get Syncd GUI](assets/getsyncd-gui-example.png)
 
-*The sidecar app: history on the left with timeline-bar thumbnails, preview + plain-English diff on the right. Click any version to see what changed vs latest.*
+*The desktop app: projects as tabs, history on the left with timeline picker, preview + plain-English diff in the middle, Git graph on the right. Click any version to see what changed. (Screenshot predates the first-run wizard.)*
 
 ### Traditional workflow vs Get Syncd
 
@@ -31,7 +31,7 @@ Grab the installer for your OS from [**Releases**](https://github.com/MihailM17/
 |--------|-------------------------------------|-----------|
 | **History** | Manual file copies, cryptic names | `get-syncd log` — one-line summaries |
 | **Compare** | Open two .drp files, eyeball | `get-syncd diff HEAD~1 HEAD` — "3 trimmed, 1 added, runtime +1.2s" |
-| **Restore** | Hunt for right .drp, re-import | `get-syncd restore HEAD~3` → Import OTIO |
+| **Restore** | Hunt for right .drp, re-import | One click — auto-imports into Resolve when possible |
 | **Storage** | Full project files (GBs) | OTIO text (~KBs), fits free GitHub |
 | **Branching** | Duplicate folders | `get-syncd branch experiment` — instant |
 | **Collaboration** | WeTransfer .drp files | `git push` / PRs on GitHub |
@@ -89,7 +89,7 @@ cd app && npm install && npm run tauri:dev   # dev
 npm run tauri:build    # release bundle for your OS (.app / .exe / .AppImage)
 ```
 
-Ready-made bundles for all three OSes are built by CI (`.github/workflows/build.yml`) on every push to `master`. The app watches `~/GetSyncd` by default (resolved per-OS, never hardcoded). Hit Save — it auto-exports the current Resolve timeline — type a note, done. History shows up on the left, preview + diff on the right. Branches, restore, delete, Scan Resolve to auto-create project folders, and Sync Resolve to snapshot the open project's timeline list.
+Ready-made bundles for all three OSes are attached to every version-tagged **Release** (built by CI from `.github/workflows/build.yml`; plain pushes only validate the build). The app watches `~/GetSyncd` by default (resolved per-OS, never hardcoded). First launch opens a wizard: it finds Resolve, creates your first project, and can back it up to a private GitHub repo. Hit Save — it auto-exports the current Resolve timeline — type a note, done. History shows up on the left, preview + diff in the middle, Git graph on the right. Branches, restore, delete, Scan Resolve to auto-create project folders, Sync Resolve to snapshot the open project's timeline list — or skip the app entirely and launch from Resolve's Scripts menu (`scripts/resolve/`, Workspace → Scripts → Comp).
 
 ### Why OTIO + git?
 
