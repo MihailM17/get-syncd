@@ -17,7 +17,7 @@ There's a CLI if you like the terminal, and a desktop app if you don't.
 
 ### Download
 
-No Python, no Terminal needed: grab the installer for your OS from [**Releases**](https://github.com/MihailM17/get-syncd/releases) — `.dmg` (macOS), `.msi`/`.exe` (Windows), `.AppImage` (Linux). It bundles everything, starts its own background service, and opens with a first-run wizard that finds Resolve and sets up `~/GetSyncd` for you.
+Grab the installer for your OS from [**Releases**](https://github.com/MihailM17/get-syncd/releases) - `.dmg` (macOS), `.msi`/`.exe` (Windows), `.AppImage` (Linux). It bundles everything, starts its own background service, and opens with a first-run wizard that finds Resolve and sets up `~/GetSyncd` for you.
 
 ### See it in action
 
