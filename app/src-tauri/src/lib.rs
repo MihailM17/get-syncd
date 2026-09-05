@@ -11,8 +11,11 @@ pub fn run() {
         )?;
       }
       // Auto-start Python sidecar (get-syncd API) so a release install just works:
-      // 1) bundled sidecar via `externalBin` (per-OS binary built in CI),
-      // 2) dev fallback: `python -m get_syncd.api_server`.
+      // 1) bundled sidecar via `externalBin` (deterministic, versioned with the app),
+      // 2) dev fallback: `python -m get_syncd.api_server`, but only when that
+      //    interpreter actually has get_syncd installed (a bare `spawn`
+      //    succeeding means nothing — the child may exit immediately with
+      //    ModuleNotFoundError, and we must NOT return early in that case).
       // NOTE: the spawned Child is intentionally forgotten — dropping it would
       // kill the sidecar; it is meant to live as long as the app.
       std::thread::spawn({
@@ -27,9 +30,17 @@ pub fn run() {
               return;
             }
           }
-          // Fallback: try python -m get_syncd.api_server (dev / no bundled sidecar)
+          // Fallback for dev machines: only use interpreters that can import us.
           let py_candidates = ["python3", "python"];
           for py in py_candidates {
+            let has_pkg = std::process::Command::new(py)
+              .args(["-c", "import get_syncd.api_server"])
+              .output()
+              .map(|o| o.status.success())
+              .unwrap_or(false);
+            if !has_pkg {
+              continue;
+            }
             let res = std::process::Command::new(py)
               .args(["-m", "get_syncd.api_server", "--port", "5174"])
               .spawn();

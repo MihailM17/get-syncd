@@ -53,13 +53,22 @@ OUT_DIR="$REPO_DIR/app/src-tauri/binaries"
 mkdir -p "$OUT_DIR"
 
 echo "→ Building $BIN_NAME for $TARGET..."
-WORKDIR="${TMPDIR:-/tmp}/pyinstaller_build"
+# Fresh workpath per build + purged bytecode caches: PyInstaller must never
+# reuse stale analysis or .pyc files (a contaminated build once shipped code
+# that didn't match the source tree and cost a full debug session).
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/pyinstaller_build.XXXXXX")"
+find "$REPO_DIR/src" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
 # NOTE: build via scripts/sidecar_entry.py (imports get_syncd as a package);
 # freezing api_server.py directly breaks its relative imports.
+# OTIO needs its plugin manifests + adapters as data files — use
+# --collect-all so _MEI/.../opentimelineio/adapters/*.json is present at runtime.
 pyinstaller --onefile --name "$BIN_NAME-$TARGET" --distpath "$OUT_DIR" --workpath "$WORKDIR" --specpath "$WORKDIR" --clean \
   --paths "$REPO_DIR/src" \
-  --hidden-import=opentimelineio --hidden-import=PIL --hidden-import=rich \
+  --collect-all opentimelineio --collect-data opentimelineio \
+  --hidden-import=opentimelineio --hidden-import=opentimelineio.adapters.builtin_adapters \
+  --hidden-import=PIL --hidden-import=rich --copy-metadata opentimelineio \
   "$REPO_DIR/scripts/sidecar_entry.py" 2>&1 | tail -n 20
+rm -rf "$WORKDIR"
 
 chmod +x "$OUT_DIR/$BIN_NAME-$TARGET" 2>/dev/null || true
 echo "Sidecar built: $OUT_DIR/$BIN_NAME-$TARGET ($(du -h "$OUT_DIR/$BIN_NAME-$TARGET" | cut -f1))"

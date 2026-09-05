@@ -11,11 +11,30 @@ Handles:
 from __future__ import annotations
 
 import dataclasses
+import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import opentimelineio as otio
+
+log = logging.getLogger(__name__)
+
+# OTIO's plugin registry loads lazily and its C++ layer has had thread-safety
+# issues under PyInstaller's loader (seen as "Error -3 while decompressing
+# data" on concurrent parses). Serialize all OTIO entry points here so every
+# caller (api server threads, CLI, GUI) is protected in one place.
+_OTIO_LOCK = threading.Lock()
+
+
+def warmup_otio() -> None:
+    """Pre-load the OTIO adapter registry. Call once, single-threaded, at startup."""
+    try:
+        with _OTIO_LOCK:
+            otio.adapters.available_adapter_names()
+    except Exception as e:
+        log.warning("OTIO warmup failed (parsing may still work): %s", e)
 
 
 # Fixed rate for normalization; 600 is divisible by 24, 25, 30, 60
@@ -259,21 +278,23 @@ def _parse_item(item, index: int) -> NormalizedClip:
 
 
 def parse_otio_file(path: str | Path) -> NormalizedTimeline:
-    """Parse an .otio file from disk."""
+    """Parse an .otio file from disk (thread-safe: serialized via _OTIO_LOCK)."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"OTIO file not found: {path}")
     try:
-        timeline = otio.adapters.read_from_file(str(path))
+        with _OTIO_LOCK:
+            timeline = otio.adapters.read_from_file(str(path))
     except Exception as e:
         raise ValueError(f"Failed to parse OTIO file {path}: {e}") from e
     return parse_timeline(timeline, source_path=str(path))
 
 
 def parse_otio_string(data: str, source_path: Optional[str] = None) -> NormalizedTimeline:
-    """Parse OTIO JSON string."""
+    """Parse OTIO JSON string (thread-safe: serialized via _OTIO_LOCK)."""
     try:
-        timeline = otio.adapters.read_from_string(data, adapter_name="otio_json")
+        with _OTIO_LOCK:
+            timeline = otio.adapters.read_from_string(data, adapter_name="otio_json")
     except Exception as e:
         raise ValueError(f"Failed to parse OTIO string: {e}") from e
     return parse_timeline(timeline, source_path=source_path)

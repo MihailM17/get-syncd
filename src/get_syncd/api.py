@@ -26,6 +26,7 @@ from .resolve_state import (
     ensure_resolve_scripting_path,
 )
 from .timeline_files import _sanitize_timeline_name, _list_timeline_files
+from .otio_parse import warmup_otio
 import logging
 
 log = logging.getLogger(__name__)
@@ -495,6 +496,21 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
         }
     except Exception as e:
         # Graceful fallback: return empty diff instead of 500
+        import traceback as _tb
+        tb = _tb.format_exc()
+        log.warning("api_diff failed for %s %s->%s timeline %s: %s\n%s", r, a, b, timeline, e, tb)
+        return {
+            "repo": str(r),
+            "a": a, "b": b,
+            "a_resolved": a2, "b_resolved": b2,
+            "summary": {"added":0,"removed":0,"trimmed":0,"reordered":0,"total_changes":0,"old_duration_s":0,"new_duration_s":0,"runtime_delta_s":0},
+            "changes": [],
+            "warnings": [f"Diff not available for timeline '{timeline}' — {e}"],
+            "tracks_compared": [],
+            "changelog": "No diff",
+            "new_track": None,
+            "text_log": "",
+        }
         return {
             "repo": str(r),
             "a": a, "b": b,

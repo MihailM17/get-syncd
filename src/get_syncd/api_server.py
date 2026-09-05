@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 import mimetypes
 
@@ -226,9 +226,14 @@ class Handler(BaseHTTPRequestHandler):
         sys.stdout.write(f"[api] {format % args}\n")
 
 def run_api_server(port: int = 5174, open_browser: bool = False):
-    # Threading server: concurrent tab switches/polls must not queue behind
-    # each other (HTTPServer is single-threaded). Handlers are stateless
-    # except the Resolve TTL cache, which is read-mostly and GIL-guarded.
+    # Warm up the OTIO adapter registry once on the main thread before any
+    # handler thread runs (lazy plugin loading is not thread-safe).
+    try:
+        from .otio_parse import warmup_otio
+
+        warmup_otio()
+    except Exception:
+        pass
     for p in range(port, port+10):
         try:
             httpd = ThreadingHTTPServer(("127.0.0.1", p), Handler)
