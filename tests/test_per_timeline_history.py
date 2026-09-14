@@ -236,3 +236,52 @@ def test_restore_legacy_version_from_timeline_filter(tmp_path=None):
         res = api.api_restore(repo, rev=h_l2, apply=False, out=str(out), timeline="2")
         assert res["ok"], res
         assert out.exists()
+
+
+def test_list_timeline_files_dedupes_case_variants(tmp_path=None):
+    """Windows/macOS-default filesystems are case-insensitive: '*.otio' already
+    matches '*.OTIO', so listing with both patterns yields the same file twice
+    and must be deduped (samefile identity, not spelling)."""
+    import tempfile
+    from get_syncd import timeline_files
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp) / "proj"
+        (repo / "timelines").mkdir(parents=True)
+        (repo / "timelines" / "1.otio").write_text("x")
+        orig_glob = pathlib.Path.glob
+
+        def fake_glob(self, pattern):
+            # Simulate a case-insensitive FS: each pattern finds the same file.
+            if pattern in ("*.otio", "*.OTIO") and self.name == "timelines":
+                return iter([self / "1.otio"])
+            return orig_glob(self, pattern)
+
+        import unittest.mock as mock
+        with mock.patch.object(pathlib.Path, "glob", fake_glob):
+            files = timeline_files._list_timeline_files(repo)
+        assert len(files) == 1, files
+
+
+def test_backslash_pathspecs_work_like_posix(tmp_path=None):
+    """Windows builds repo-relative paths with backslashes; git needs forward
+    slashes. log/status/restore must accept both forms identically."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp) / "proj"
+        (repo / "timelines").mkdir(parents=True)
+        git_store.init_repo(repo)
+        import shutil as _sh
+        _sh.copy("tests/fixtures/base.otio", str(repo / "timelines" / "5.otio"))
+        h = git_store.save_version(repo, repo / "timelines" / "5.otio", "Save 5",
+                                   timeline_dest="timelines/5.otio")
+        fwd = git_store.log_versions(repo, limit=5, timeline_file="timelines/5.otio",
+                                     fallback=False)
+        back = git_store.log_versions(repo, limit=5, timeline_file="timelines\\5.otio",
+                                      fallback=False)
+        assert fwd, "forward-slash baseline found nothing"
+        assert [v["hash"] for v in back] == [v["hash"] for v in fwd]
+        st = git_store.status(repo, timeline_file="timelines\\5.otio")
+        assert st["is_repo"] is True
+        out = pathlib.Path(tmp) / "restored.otio"
+        git_store.restore_version(repo, h, out, timeline_file="timelines\\5.otio")
+        assert out.exists()

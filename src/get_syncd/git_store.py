@@ -20,6 +20,26 @@ def _run_git(args: list[str], cwd: Path | str = ".", check: bool = True) -> subp
     )
 
 
+def _posix_pathspec(p: str | Path) -> str:
+    """Repo-relative path in git's forward-slash form.
+
+    Windows callers build these with backslashes (str(Path.relative_to)),
+    which git treats as escape characters — every `git show rev:<path>`,
+    `git log -- <path>` etc. then fails. Normalize once, here: pathlib still
+    resolves the result for filesystem use, and it matches `git show
+    --name-only` output for comparisons.
+
+    NOTE: the backslash replacement must be explicit — on POSIX a backslash
+    is an ordinary filename character, so Path(...).as_posix() alone is a
+    no-op there and would leave Windows-style input broken.
+    """
+    s = str(p).replace("\\", "/")
+    try:
+        return Path(s).as_posix()
+    except Exception:
+        return s
+
+
 def is_git_repo(path: Path | str = ".") -> bool:
     p = Path(path)
     # Check for direct .git in this folder (handles nested projects correctly)
@@ -204,6 +224,7 @@ def save_version(
     timeline_dest: str = "timeline.otio",
 ) -> str:
     """Copy OTIO into repo, commit. Returns commit hash."""
+    timeline_dest = _posix_pathspec(timeline_dest)
     repo = Path(repo_path)
     src = Path(otio_source)
     if not src.exists():
@@ -293,6 +314,7 @@ def save_version(
 
 def status(repo_path: Path | str = ".", timeline_file: str = "timeline.otio") -> dict:
     """Return status dict: has_changes, is_repo, etc."""
+    timeline_file = _posix_pathspec(timeline_file)
     repo = Path(repo_path)
     if not is_git_repo(repo):
         return {"is_repo": False, "has_changes": None, "message": "Not a git repo — run get-syncd init"}
@@ -381,6 +403,7 @@ def restore_version(
     timeline_file: str = "timeline.otio",
 ) -> Path:
     """Restore a past version to out_path (does not overwrite working file unless out_path == timeline_file)."""
+    timeline_file = _posix_pathspec(timeline_file)
     repo = Path(repo_path)
     out = Path(out_path)
     if not is_git_repo(repo):
@@ -432,9 +455,9 @@ def log_versions(
         if timeline_file is None:
             paths: list[str] = []
         elif isinstance(timeline_file, (list, tuple)):
-            paths = [str(p) for p in timeline_file if str(p).strip()]
+            paths = [_posix_pathspec(p) for p in timeline_file if str(p).strip()]
         else:
-            paths = [str(timeline_file)]
+            paths = [_posix_pathspec(timeline_file)]
         if paths:
             r = _run_git(["log", f"-n{limit}", "--pretty=format:%H|%an|%ad|%s", "--date=short", "--"] + paths, cwd=repo, check=False)
         else:
@@ -463,6 +486,7 @@ def delete_version(repo_path: Path | str, rev: str, timeline_file: str = "timeli
     Handles both HEAD and older commits via reset/rebase. Cleans up preview/snapshot.
     Returns {"ok": True, "deleted": short, "new_head": short_or_None}
     """
+    timeline_file = _posix_pathspec(timeline_file)
     repo = Path(repo_path)
     if not is_git_repo(repo):
         raise ValueError("Not a git repo")

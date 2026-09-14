@@ -5,6 +5,7 @@ Split out of api.py (#5). Pure filesystem logic, no Resolve calls.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -48,7 +49,7 @@ def resolve_timeline_selection(repo: Path, timeline: str | None = None) -> tuple
         if cur and name != cur and name != "timeline":
             candidate = td / f"{_sanitize_timeline_name(name)}.otio"
             if candidate.exists():
-                return name, str(candidate.relative_to(repo))
+                return name, candidate.relative_to(repo).as_posix()
             return name, f"timelines/{_sanitize_timeline_name(name)}.otio"
         return name, "timeline.otio"
     if not name:
@@ -63,19 +64,37 @@ def resolve_timeline_selection(repo: Path, timeline: str | None = None) -> tuple
 
 
 def _list_timeline_files(repo: Path) -> list[Path]:
-    """List all versioned timeline files in repo (timelines/*.otio + legacy)."""
+    """List all versioned timeline files in repo (timelines/*.otio + legacy).
+
+    Dedup is by identity, not spelling: on case-insensitive filesystems
+    (Windows, macOS default) the "*.otio" glob already matches "*.OTIO", so
+    extending with both patterns lists every file twice. os.path.samefile
+    collapses those (and any other aliasing) while keeping genuinely
+    distinct files apart on case-sensitive volumes.
+    """
     files: list[Path] = []
+
+    def _add(p: Path) -> None:
+        for q in files:
+            if p == q:
+                return
+            try:
+                if os.path.samefile(p, q):
+                    return
+            except OSError:
+                continue
+        files.append(p)
+
     timelines_dir = repo / "timelines"
     if timelines_dir.exists():
-        files.extend(sorted(timelines_dir.glob("*.otio")))
-        files.extend(sorted(timelines_dir.glob("*.OTIO")))
+        for p in sorted(timelines_dir.glob("*.otio")):
+            _add(p)
+        for p in sorted(timelines_dir.glob("*.OTIO")):
+            _add(p)
     legacy = repo / "timeline.otio"
     if legacy.exists():
-        if not files:
-            files.append(legacy)
-        elif legacy not in files:
-            files.append(legacy)
+        _add(legacy)
     for p in repo.glob("*.otio"):
-        if p not in files and p.name.lower() != "timeline.otio":
-            files.append(p)
+        if p.name.lower() != "timeline.otio":
+            _add(p)
     return files

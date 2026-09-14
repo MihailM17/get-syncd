@@ -152,6 +152,25 @@ def _resolve_repo(repo: str | Path | None) -> Path:
         p = p.parent
     return p.resolve()
 
+def _rel(repo: Path, p: Path | str) -> str:
+    """Repo-relative path in git's forward-slash form for JSON/git use.
+
+    str(Path.relative_to) yields backslashes on Windows, which git treats as
+    escape characters and which never match `git show --name-only` output —
+    normalize once here (see git_store._posix_pathspec).
+    """
+    try:
+        q = Path(p)
+        if q.is_relative_to(repo):
+            return git_store._posix_pathspec(q.relative_to(repo))
+    except Exception:
+        pass
+    try:
+        return git_store._posix_pathspec(p)
+    except Exception:
+        return str(p)
+
+
 def _alias_versions(repo: Path, tfile: str | None, limit: int) -> list[dict]:
     """History for numeric (1 = latest) alias resolution.
 
@@ -320,7 +339,7 @@ def api_status(repo: str | Path | None = None) -> dict:
     for name in combined_names:
         tf = _get_timeline_file(r, name if name != "timeline" else None)
         # For legacy, use git_store.status with specific file
-        rel = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
+        rel = _rel(r, tf)
         if not tf.exists():
             # No working file: either never exported (not a change) or deleted
             # (real change). Never fall back to another timeline's file here —
@@ -432,7 +451,7 @@ def api_timelines(repo: str | Path | None = None) -> dict:
     # Build timeline list with status
     timelines = []
     for f in files:
-        rel = str(f.relative_to(r)) if f.is_relative_to(r) else str(f)
+        rel = _rel(r, f)
         name = f.stem if f.name != "timeline.otio" else (cur or "timeline")
         # If legacy file and we have a current, use current name
         if f.name == "timeline.otio" and cur and len(all_names) > 1:
@@ -468,7 +487,7 @@ def api_log(repo: str | Path | None = None, limit: int = 20, timeline: str | Non
         # to timeline.otio, so single-file projects keep working unchanged.)
         try:
             tf = _get_timeline_file(r, timeline)
-            rel = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
+            rel = _rel(r, tf)
         except Exception:
             return []
         versions = git_store.log_versions(r, limit=limit, timeline_file=rel, fallback=False)
@@ -527,7 +546,7 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
     tfile = None
     if timeline:
         tf = _get_timeline_file(r, timeline)
-        tfile = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
+        tfile = _rel(r, tf)
     # resolve numeric aliases via cli helper logic (duplicate to avoid cli import)
     def _alias(rev: str) -> str:
         rev = rev.strip()
@@ -674,7 +693,7 @@ def api_save(repo: str | Path | None = None, file: str | Path | None = None, mes
                         src = cand2
             if src and src.exists():
                 try:
-                    h = git_store.save_version(r, src, message or f"Save {name}", timeline_dest=str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf))
+                    h = git_store.save_version(r, src, message or f"Save {name}", timeline_dest=_rel(r, tf))
                     results.append({"timeline": name, "ok": True, "hash": h})
                 except Exception as e:
                     results.append({"timeline": name, "ok": False, "error": str(e)})
@@ -732,13 +751,13 @@ def api_save(repo: str | Path | None = None, file: str | Path | None = None, mes
     dest = None
     if tname:
         dest = _get_timeline_file(r, tname)
-        dest_rel = str(dest.relative_to(r)) if dest.is_relative_to(r) else str(dest)
+        dest_rel = _rel(r, dest)
     else:
         # Infer dest from src if it's in timelines/
         try:
             if src and Path(src).is_relative_to(r / "timelines"):
                 dest = Path(src)
-                dest_rel = str(dest.relative_to(r))
+                dest_rel = _rel(r, dest)
                 tname = dest.stem
             elif src and Path(src).name == "timeline.otio":
                 dest = r / "timeline.otio"
@@ -799,7 +818,7 @@ def api_restore(repo: str | Path | None = None, rev: str = "HEAD", apply: bool =
             tname = cur
     if tname:
         tf = _get_timeline_file(r, tname)
-        tfile = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
+        tfile = _rel(r, tf)
     else:
         # Try to infer from rev's file
         tfile = "timeline.otio"
@@ -1009,7 +1028,7 @@ def api_graph_viz(repo: str | Path | None = None, timeline: str | None = None) -
         # (same scope as api_log, so graph and list agree)
         if timeline:
             tf = _get_timeline_file(r, timeline)
-            tfile = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
+            tfile = _rel(r, tf)
             log_r = subprocess.run(["git", "log", "--all", "--pretty=format:%H%x1f%P%x1f%D%x1f%s%x1f%ar%x1f%ad", "--date=short", "--reverse", "--", tfile], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace")
             # Do NOT fallback to all — if timeline has no history, return empty (strict per-timeline filtering)
             if log_r.returncode != 0 or not log_r.stdout.strip():
@@ -1130,7 +1149,7 @@ def api_delete(repo: str | Path | None = None, rev: str = "", timeline: str | No
     tfile = None
     if timeline:
         tf = _get_timeline_file(r, timeline)
-        tfile = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
+        tfile = _rel(r, tf)
     # numeric alias: 1 = latest
     def _alias(rv: str) -> str:
         rv = rv.strip()
