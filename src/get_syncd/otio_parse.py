@@ -17,7 +17,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import opentimelineio as otio
+# NOTE: OpenTimelineIO is intentionally NOT imported at module top-level.
+# It costs ~seconds to import (plugin registry + C++ layer) and dominated
+# cold start (~12s in the PyInstaller sidecar). All OTIO access goes through
+# _otio() below so `import get_syncd.api` stays cheap and the API server can
+# answer /health instantly, warming OTIO in the background instead.
+_otio_mod = None
+_WARMED_UP = False
 
 log = logging.getLogger(__name__)
 
@@ -28,11 +34,31 @@ log = logging.getLogger(__name__)
 _OTIO_LOCK = threading.Lock()
 
 
+def _otio():
+    """Lazy `import opentimelineio`, cached. Call inside _OTIO_LOCK or a function."""
+    global _otio_mod
+    if _otio_mod is None:
+        import opentimelineio as _m
+
+        _otio_mod = _m
+    return _otio_mod
+
+
 def warmup_otio() -> None:
-    """Pre-load the OTIO adapter registry. Call once, single-threaded, at startup."""
+    """Pre-load the OTIO adapter registry. Call once, single-threaded, at startup.
+
+    Idempotent and safe to call from a background thread after the server is
+    already listening — that is the whole point (fast /health, warm later).
+    """
+    global _WARMED_UP
+    if _WARMED_UP:
+        return
     try:
         with _OTIO_LOCK:
-            otio.adapters.available_adapter_names()
+            if _WARMED_UP:
+                return
+            _otio().adapters.available_adapter_names()
+            _WARMED_UP = True
     except Exception as e:
         log.warning("OTIO warmup failed (parsing may still work): %s", e)
 
@@ -134,6 +160,7 @@ def _rescale(value: float, from_rate: float, to_rate: float = NORMALIZED_RATE) -
 
 
 def _parse_item(item, index: int) -> NormalizedClip:
+    otio = _otio()
     schema = item.schema_name() if hasattr(item, "schema_name") else type(item).__name__
 
     if isinstance(item, otio.schema.Clip):
@@ -271,7 +298,7 @@ def _parse_item(item, index: int) -> NormalizedClip:
     return NormalizedClip(
         kind="unknown",
         index=index,
-        name=getattr(item, "name", f"Unknown_{index}"),
+        name=getattr(item, "name", f"Unknown_{index}") or f"Unknown_{index}",
         url="",
         duration_frames=dur,
     )
@@ -284,7 +311,7 @@ def parse_otio_file(path: str | Path) -> NormalizedTimeline:
         raise FileNotFoundError(f"OTIO file not found: {path}")
     try:
         with _OTIO_LOCK:
-            timeline = otio.adapters.read_from_file(str(path))
+            timeline = _otio().adapters.read_from_file(str(path))
     except Exception as e:
         raise ValueError(f"Failed to parse OTIO file {path}: {e}") from e
     return parse_timeline(timeline, source_path=str(path))
@@ -294,7 +321,7 @@ def parse_otio_string(data: str, source_path: Optional[str] = None) -> Normalize
     """Parse OTIO JSON string (thread-safe: serialized via _OTIO_LOCK)."""
     try:
         with _OTIO_LOCK:
-            timeline = otio.adapters.read_from_string(data, adapter_name="otio_json")
+            timeline = _otio().adapters.read_from_string(data, adapter_name="otio_json")
     except Exception as e:
         raise ValueError(f"Failed to parse OTIO string: {e}") from e
     return parse_timeline(timeline, source_path=source_path)
@@ -302,6 +329,7 @@ def parse_otio_string(data: str, source_path: Optional[str] = None) -> Normalize
 
 def parse_timeline(timeline, source_path: Optional[str] = None) -> NormalizedTimeline:
     """Convert an otio.schema.Timeline into NormalizedTimeline."""
+    otio = _otio()
     name = getattr(timeline, "name", "") or "Untitled"
 
     global_start = None

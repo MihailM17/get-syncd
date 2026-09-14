@@ -20,7 +20,10 @@ from .otio_parse import parse_otio_file
 PREVIEW_DIRNAME = ".get-syncd/previews"
 
 def _preview_path(repo: Path, rev_hash: str) -> Path:
-    return repo / PREVIEW_DIRNAME / f"{rev_hash[:8]}.png"
+    # Live ("current-<hash>") previews keep their full tag — truncating to 8
+    # chars collapsed every timeline into one "current-.png" file.
+    name = rev_hash if rev_hash.startswith("current-") else rev_hash[:8]
+    return repo / PREVIEW_DIRNAME / f"{name}.png"
 
 def generate_preview(repo: Path, rev_hash: str, otio_path: Path) -> Path | None:
     out = _preview_path(repo, rev_hash)
@@ -58,6 +61,8 @@ def generate_preview(repo: Path, rev_hash: str, otio_path: Path) -> Path | None:
         w = max(6, int(usable * (c.duration_frames / total_dur)))
         if x + w > W - pad:
             w = W - pad - x
+        if w <= 0:
+            break
         col = palette[i % len(palette)]
         draw.rounded_rectangle([x, bar_y, x+w, bar_y+bar_h], radius=6, fill=col, outline=(255,255,255,40))
         label = (c.name[:10] + "…") if len(c.name) > 10 else c.name
@@ -65,7 +70,7 @@ def generate_preview(repo: Path, rev_hash: str, otio_path: Path) -> Path | None:
         x += w + 3
         if x >= W - pad:
             break
-    draw.text((pad, H-16), rev_hash[:8], fill=(100,100,100))
+    draw.text((pad, H-16), out.stem, fill=(100,100,100))
     img.save(out)
     return out
 

@@ -13,6 +13,6 @@
 cp scripts/resolve/GetSyncd_Launch.py "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Comp/"
 ```
 
-The repo installers (`install-mac.sh`, `install-linux.sh`, `install-windows.ps1`) attempt this copy automatically — best effort, they skip it if the Resolve folders don't exist or need admin rights.
+The repo installers print the exact copy command (with `sudo` where needed) but don't run it — copy the file yourself, then restart Resolve.
 
 `resolve_export.py` (one folder up) is the older Console-paste helper; the launcher supersedes it for normal use.

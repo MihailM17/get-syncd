@@ -276,7 +276,9 @@ def run_viewer(repo: Path, rev_a: str, rev_b: str, port: int = 8000, open_browse
     # Try ports if busy
     for p in range(port, port + 10):
         try:
-            with socketserver.TCPServer(("", p), ViewerHandler) as httpd:
+            # Loopback only — the viewer exposes clip names/paths and must
+            # never listen on LAN interfaces (matches the API server).
+            with socketserver.TCPServer(("127.0.0.1", p), ViewerHandler) as httpd:
                 url = f"http://localhost:{p}/"
                 print(f"Get Syncd viewer: {rev_a} → {rev_b}")
                 print(f"  {data['summary']}")

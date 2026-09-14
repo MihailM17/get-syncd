@@ -20,7 +20,7 @@ pip install -e .
 echo ""
 echo "Done! Test it:"
 echo "  get-syncd --help"
-echo "  pytest -q   (should say 27 passed)"
+echo "  pytest -q   (should pass with no failures)"
 echo ""
 echo "Next: mkdir ~/Movies/MyFilm && cd ~/Movies/MyFilm && get-syncd init"
 echo ""

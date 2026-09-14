@@ -617,17 +617,21 @@ def diff_timelines(
     if not old_main and not new_main:
         return TimelineDiff(summary={"added": 0, "removed": 0, "trimmed": 0, "reordered": 0, "total_changes": 0}, warnings=["No video tracks found"])
     if not old_main:
-        # All added
+        # All added (e.g. a timeline's first save vs an empty timeline)
         d = TimelineDiff(tracks_compared=[new_main.name] if new_main else [], warnings=warnings)
         for item in new_main.items:
             d.changes.append(ClipChange(type="added", index_new=item.index, clip_name=item.name, url=item.url, kind=item.kind))
-        d.summary = {"added": len(new_main.items), "removed": 0, "trimmed": 0, "reordered": 0, "total_changes": len(d.changes)}
+        new_dur = new_main.duration_frames()
+        d.summary = {"added": len(new_main.items), "removed": 0, "trimmed": 0, "reordered": 0, "total_changes": len(d.changes),
+                     "old_duration_s": 0.0, "new_duration_s": round(_frames_to_seconds(new_dur), 3), "runtime_delta_s": round(_frames_to_seconds(new_dur), 3)}
         return d
     if not new_main:
         d = TimelineDiff(tracks_compared=[old_main.name], warnings=warnings)
         for item in old_main.items:
             d.changes.append(ClipChange(type="removed", index_old=item.index, clip_name=item.name, url=item.url, kind=item.kind))
-        d.summary = {"added": 0, "removed": len(old_main.items), "trimmed": 0, "reordered": 0, "total_changes": len(d.changes)}
+        old_dur = old_main.duration_frames()
+        d.summary = {"added": 0, "removed": len(old_main.items), "trimmed": 0, "reordered": 0, "total_changes": len(d.changes),
+                     "old_duration_s": round(_frames_to_seconds(old_dur), 3), "new_duration_s": 0.0, "runtime_delta_s": round(_frames_to_seconds(-old_dur), 3)}
         return d
 
     d = diff_tracks(old_main, new_main)

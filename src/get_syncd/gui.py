@@ -1,6 +1,7 @@
 """Get Syncd — Sidecar desktop app (v2 friendly).
 
-One place for everything: all timelines live in ~/GetSyncd/timeline.otio
+One place for everything: each Resolve timeline versions into
+timelines/<name>.otio (legacy single-file repos use timeline.otio).
 No hunting for files — the app *is* the place.
 - Big friendly buttons: Export, Save, Refresh
 - Live preview image per version (timeline bar)
@@ -33,6 +34,28 @@ from .otio_parse import parse_otio_file
 from .diff import diff_timelines, changelog_line
 from .preview import generate_preview, _preview_path, ensure_previews, HAS_PIL
 from .resolve_state import ensure_resolve_scripting_path
+from .timeline_files import _sanitize_timeline_name, resolve_timeline_selection
+
+
+def _timeline_file_for_repo(repo: Path) -> tuple[str | None, Path]:
+    """(timeline name or None, working file). Migrated repos follow Resolve's
+    current timeline into timelines/<name>.otio; otherwise the legacy file."""
+    try:
+        name, rel = resolve_timeline_selection(repo, None)
+    except Exception:
+        return None, repo / "timeline.otio"
+    return name, repo / rel
+
+
+def _rev_show_file(repo: Path, rev: str) -> str:
+    """Which .otio path to `git show` for a revision (per-timeline or legacy)."""
+    try:
+        files = git_store.commit_otio_files(repo, rev)
+        if files:
+            return files[0]
+    except Exception:
+        pass
+    return "timeline.otio"
 
 # PIL ImageTk needed for display (separate from preview generation)
 try:
@@ -102,7 +125,7 @@ def _try_resolve_export(out_path: Path) -> tuple[bool, str]:
                     return True, f"Exported '{name}' → {out_path} via project.ExportTimeline"
             except Exception:
                 pass
-        return False, "Auto export not available in this Resolve version. Use File → Export Timeline → OpenTimelineIO → timeline.otio (manual fallback works)."
+        return False, f"Auto export not available in this Resolve version. Use File → Export Timeline → OpenTimelineIO → {out_path} (manual fallback works — it must land exactly there)."
     except Exception as e:
         return False, f"Export error: {e}"
 
@@ -130,12 +153,19 @@ def _get_branches(repo: Path) -> list[str]:
     except Exception:
         pass
     return []
+def _valid_branch_name(name: str) -> bool:
+    name = (name or "").strip()
+    if not name or name.startswith("-") or ".." in name:
+        return False
+    return not any(c in name for c in " ~^:?*[]\\")
+
 
 def _create_branch(repo: Path, name: str):
-    subprocess.run(["git", "checkout", "-b", name], cwd=str(repo), check=True)
+    subprocess.run(["git", "checkout", "-b", name, "--"], cwd=str(repo), check=True)
+
 
 def _switch_branch(repo: Path, name: str):
-    subprocess.run(["git", "checkout", name], cwd=str(repo), check=True)
+    subprocess.run(["git", "checkout", name, "--"], cwd=str(repo), check=True)
 
 # ---------- App ----------
 class SidecarApp:
@@ -288,7 +318,7 @@ class SidecarApp:
         self.diff_text.configure(state="disabled")
 
         # hint bar
-        self.hint = ttk.Label(self.root, text="Keep this window beside Resolve. Export → type a note → Save. Pick any old version → Change to this version. Use Refresh if you exported manually to ~/GetSyncd/timeline.otio", foreground="#666", wraplength=1060, justify=tk.LEFT, font=("SF Pro Text", 10))
+        self.hint = ttk.Label(self.root, text="Keep this window beside Resolve. Export → type a note → Save. Pick any old version → Change to this version. Manual exports must land in timelines/<name>.otio (or timeline.otio in older single-file projects) — then Refresh.", foreground="#666", wraplength=1060, justify=tk.LEFT, font=("SF Pro Text", 10))
         self.hint.pack(fill=tk.X, padx=12, pady=(4,10))
 
     # ---------- refresh (fixes "didn't detect") ----------
@@ -301,9 +331,11 @@ class SidecarApp:
         except Exception:
             pass
 
-        # status
+        # status — scoped to the current timeline's file (legacy file lies in migrated repos)
         try:
-            res = git_store.status(self.repo)
+            _st_name, _st_file = _timeline_file_for_repo(self.repo)
+            _st_rel = str(_st_file.relative_to(self.repo)) if _st_file.is_relative_to(self.repo) else _st_file.name
+            res = git_store.status(self.repo, timeline_file=_st_rel)
             msg = res.get("message", "")
             has = res.get("has_changes")
             if has is True:
@@ -321,12 +353,20 @@ class SidecarApp:
             # update diff preview for unsaved changes
             if has is True:
                 try:
+                    _, _cur_file = _timeline_file_for_repo(self.repo)
+                    _cur_rel = str(_cur_file.relative_to(self.repo)) if _cur_file.is_relative_to(self.repo) else _cur_file.name
                     with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tmp:
                         tp = tmp.name
                     try:
-                        git_store.restore_version(self.repo, "HEAD", tp)
+                        try:
+                            git_store.restore_version(self.repo, "HEAD", tp, timeline_file=_cur_rel)
+                        except Exception:
+                            if _cur_rel != "timeline.otio":
+                                git_store.restore_version(self.repo, "HEAD", tp, timeline_file="timeline.otio")
+                            else:
+                                raise
                         old = parse_otio_file(tp)
-                        new = parse_otio_file(self.repo / "timeline.otio")
+                        new = parse_otio_file(_cur_file)
                         d = diff_timelines(old, new)
                         self._set_diff_text(f"Unsaved vs last save:\n{changelog_line(d)}\n\n" + "\n".join(f"  {ch.type:12} {ch.clip_name}" for ch in d.changes[:12]))
                         if not self.msg_var.get():
@@ -358,9 +398,10 @@ class SidecarApp:
             self.tree.delete(i)
         self._preview_images.clear()
         try:
-            versions = git_store.log_versions(self.repo, limit=50)
+            versions = git_store.log_versions(self.repo, limit=50, timeline_file=None)
             if not versions:
-                self._set_diff_text("No saved versions yet.\n\n1) In Resolve: File → Export Timeline → OpenTimelineIO → save as ~/GetSyncd/timeline.otio (overwrite)\n2) Click Refresh if you just exported\n3) Type a note and click Save version\n→ It will appear here as a clickable row (#1 = newest).")
+                _, _dest0 = _timeline_file_for_repo(self.repo)
+                self._set_diff_text(f"No saved versions yet.\n\n1) In Resolve: File → Export Timeline → OpenTimelineIO → save as {_dest0} (overwrite)\n2) Click Refresh if you just exported\n3) Type a note and click Save version\n→ It will appear here as a clickable row (#1 = newest).")
                 # also show in tree as placeholder
                 self.tree.insert("", tk.END, values=("", "—", "—", "No saved versions yet — Save one above", ""))
             else:
@@ -422,7 +463,7 @@ class SidecarApp:
             return
         # Update preview image for selected version
         try:
-            versions = git_store.log_versions(self.repo, limit=50)
+            versions = git_store.log_versions(self.repo, limit=50, timeline_file=None)
             idx = num - 1
             if 0 <= idx < len(versions):
                 v = versions[idx]
@@ -452,8 +493,8 @@ class SidecarApp:
                 with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tb:
                     pb = tb.name
                 try:
-                    git_store.restore_version(self.repo, a, pa)
-                    git_store.restore_version(self.repo, b, pb)
+                    git_store.restore_version(self.repo, a, pa, timeline_file=_rev_show_file(self.repo, a))
+                    git_store.restore_version(self.repo, b, pb, timeline_file=_rev_show_file(self.repo, b))
                     old = parse_otio_file(pa); new = parse_otio_file(pb)
                     d = diff_timelines(old, new)
                     txt = f"Version {num} vs latest:\n{changelog_line(d)}\n\n" + "\n".join(f"{ch.type:12} {ch.clip_name}  {str(ch.details)[:80]}" for ch in d.changes[:20])
@@ -467,7 +508,7 @@ class SidecarApp:
 
     # ---------- actions ----------
     def _export(self):
-        out = self.repo / "timeline.otio"
+        _exp_name, out = _timeline_file_for_repo(self.repo)
         env_out = os.environ.get("GET_SYNCD_OUT")
         if env_out:
             out = Path(env_out).expanduser()
@@ -487,38 +528,53 @@ class SidecarApp:
 
     def _save(self):
         msg = self.msg_var.get().strip()
-        src = self.repo / "timeline.otio"
-        if not src.exists():
+        tname, dest = _timeline_file_for_repo(self.repo)
+        dest_rel = str(dest.relative_to(self.repo)) if dest.is_relative_to(self.repo) else dest.name
+        src = dest if dest.exists() else None
+        if src is None:
             cand = git_store.find_timeline_candidate(self.repo)
             if cand and cand.exists():
                 src = cand
                 try:
                     rel = cand.relative_to(self.repo)
-                    if str(rel) != "timeline.otio":
-                        print(f"[gui] Using discovered timeline: {rel}")
+                    # A per-timeline discovery stays per-timeline — never collapse into legacy storage.
+                    if rel.parts and rel.parts[0] == "timelines" and ".get-syncd" not in rel.parts:
+                        dest = cand
+                        dest_rel = str(rel)
+                        tname = cand.stem
+                    if str(rel) != dest_rel:
+                        print(f"[gui] Using discovered timeline: {rel} (saving as {dest_rel})")
                 except Exception:
                     pass
             else:
-                messagebox.showerror("No timeline", f"No {src} yet. Click Export or File → Export Timeline → OpenTimelineIO → {src}")
+                messagebox.showerror("No timeline", f"No {dest} yet. Click Export or File → Export Timeline → OpenTimelineIO → {dest}")
                 return
         if not msg:
             try:
                 with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tmp:
                     tp = tmp.name
                 try:
-                    git_store.restore_version(self.repo, "HEAD", tp)
+                    try:
+                        git_store.restore_version(self.repo, "HEAD", tp, timeline_file=dest_rel)
+                    except Exception:
+                        if dest_rel != "timeline.otio":
+                            git_store.restore_version(self.repo, "HEAD", tp, timeline_file="timeline.otio")
+                        else:
+                            raise
                     old = parse_otio_file(tp); new = parse_otio_file(src)
                     d = diff_timelines(old, new)
                     msg = changelog_line(d)
+                    if tname and tname != "timeline":
+                        msg = f"{tname}: {msg}"
                 except Exception:
-                    msg = "Save version"
+                    msg = f"Initial {tname}" if tname and tname != "timeline" else "Save version"
                 finally:
                     try: Path(tp).unlink()
                     except: pass
             except Exception:
                 msg = "Save version"
         try:
-            h = git_store.save_version(self.repo, src, msg)
+            h = git_store.save_version(self.repo, src, msg, timeline_dest=dest_rel)
             # generate preview for new version
             try:
                 generate_preview(self.repo, h, src)
@@ -546,27 +602,30 @@ class SidecarApp:
             return
         vals = self.tree.item(sel[0], "values")
         num = str(vals[0])
-        if not messagebox.askyesno("Change to this version?", f"Overwrite {self.repo / 'timeline.otio'} with version {num} ({vals[2]})?\n\nThis becomes your current timeline. Next Resolve import will show it.\nBackup saved to .get-syncd/backups/."):
+        _, out = _timeline_file_for_repo(self.repo)
+        if not messagebox.askyesno("Change to this version?", f"Overwrite {out} with version {num} ({vals[2]})?\n\nThis becomes your current timeline. Next Resolve import will show it.\nBackup saved to .get-syncd/backups/."):
             return
         try:
-            versions = git_store.log_versions(self.repo, limit=50)
+            versions = git_store.log_versions(self.repo, limit=50, timeline_file=None)
             idx = int(num)-1
             rev = versions[idx]["hash"] if 0 <= idx < len(versions) else num
-            out = self.repo / "timeline.otio"
             if out.exists():
                 bdir = self.repo / ".get-syncd" / "backups"
                 bdir.mkdir(parents=True, exist_ok=True)
                 import shutil, datetime
-                ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                shutil.copy2(str(out), str(bdir / f"timeline-{ts}.otio"))
-            git_store.restore_version(self.repo, rev, out)
+                ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                shutil.copy2(str(out), str(bdir / f"{out.stem}-{ts}.otio"))
+            try:
+                git_store.restore_version(self.repo, rev, out, timeline_file=_rev_show_file(self.repo, rev))
+            except Exception:
+                git_store.restore_version(self.repo, rev, out)
             messagebox.showinfo("Changed", f"Now using version {num}.\n\nResolve → File → Import Timeline → OpenTimelineIO → {out}")
             self._refresh_all()
         except Exception as e:
             messagebox.showerror("Restore failed", str(e))
 
     def _view_selected(self):
-        versions = git_store.log_versions(self.repo, limit=50)
+        versions = git_store.log_versions(self.repo, limit=50, timeline_file=None)
         if len(versions) < 2:
             messagebox.showinfo("Need 2", "Save at least 2 versions to view.")
             return
@@ -582,20 +641,38 @@ class SidecarApp:
         except Exception as e:
             messagebox.showerror("Viewer failed", str(e))
 
+    def _worktree_dirty(self) -> bool:
+        try:
+            r = subprocess.run(["git", "status", "--porcelain"], cwd=str(self.repo), capture_output=True, text=True)
+            return bool(r.stdout.strip())
+        except Exception:
+            return False
+
     def _new_branch(self):
         name = simpledialog.askstring("New branch", "Branch name (e.g. experiment):")
         if not name: return
+        if not _valid_branch_name(name):
+            messagebox.showerror("Branch failed", f"'{name.strip()}' is not a valid branch name (letters, numbers, . _ - / only).")
+            return
         try:
             _create_branch(self.repo, name.strip())
             self._refresh_all()
-            messagebox.showinfo("Branch", f"Created and switched to '{name}'")
+            messagebox.showinfo("Branch", f"Created and switched to '{name.strip()}'")
         except Exception as e:
             messagebox.showerror("Branch failed", str(e))
 
     def _switch_branch(self):
         name = self.branch_var.get().strip()
         if not name: return
+        if not _valid_branch_name(name):
+            messagebox.showerror("Switch failed", f"'{name}' is not a valid branch name.")
+            return
         try:
+            if self._worktree_dirty() and not messagebox.askyesno(
+                "Unsaved changes",
+                "You have unsaved timeline changes — switching branches carries them along.\n\nSave first, or switch anyway?",
+            ):
+                return
             _switch_branch(self.repo, name)
             self._refresh_all()
         except Exception as e:

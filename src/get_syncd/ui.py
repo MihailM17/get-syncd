@@ -149,9 +149,7 @@ def print_log(versions: list[dict], limit: int = 20):
         table.add_column("What changed", style="white")
         # Show newest first, number 1 = newest, to make `get-syncd diff 2 1` intuitive
         for i, v in enumerate(versions):
-            num = str(len(versions) - i) if False else str(i+1)  # 1 = newest
-            # Actually show 1-newest indexing reversed for natural HEAD ordering: 1=newest
-            # We'll show both: leftmost is recency rank
+            num = str(i + 1)  # 1 = newest
             is_latest = i == 0
             ver = f"{v['short']}" + (" ← latest" if is_latest else "")
             table.add_row(num, ver, v["date"], escape(v["message"]))

@@ -89,7 +89,7 @@ jobs:
         run: |
           python -m venv ..\.venv
           ..\.venv\Scripts\pip install -e .. pyinstaller
-          ..\.venv\Scripts\pyinstaller --onefile --name get-syncd-api-${{ matrix.target }} --distpath src-tauri/binaries --workpath $env:TEMP\pyinstaller_build --specpath $env:TEMP --clean --paths ..\src --collect-all opentimelineio --collect-data opentimelineio --hidden-import=opentimelineio --hidden-import=opentimelineio.adapters.builtin_adapters --copy-metadata opentimelineio --hidden-import=PIL --hidden-import=rich ..\scripts\sidecar_entry.py
+          ..\.venv\Scripts\pyinstaller --onefile --name get-syncd-api-${{ matrix.target }} --distpath src-tauri/binaries --workpath $env:TEMP\pyinstaller_build --specpath $env:TEMP --clean --paths ..\src --collect-all opentimelineio --collect-data opentimelineio --hidden-import=opentimelineio --hidden-import=opentimelineio.adapters.builtin_adapters --copy-metadata opentimelineio --copy-metadata get-syncd --hidden-import=PIL --hidden-import=rich ..\scripts\sidecar_entry.py
       # Version tags (v*) build AND publish: the .dmg/.exe/.msi/.AppImage get
       # attached to a GitHub Release — Releases are the main download.
       # Plain pushes/PRs only validate the build (no release).

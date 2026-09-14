@@ -38,7 +38,7 @@ Grab the installer for your OS from [**Releases**](https://github.com/MihailM17/
 
 ### How it works
 
-`Save button` → auto-export current timeline from Resolve → `timeline.otio` → git commit → (optional) push to GitHub. (Manual fallback: `File → Export Timeline → OpenTimelineIO`.)
+`Save button` → auto-export current timeline from Resolve → `timelines/<name>.otio` → git commit → (optional) push to GitHub. (Manual fallback: `File → Export Timeline → OpenTimelineIO` → `timelines/<name>.otio`.) Each Resolve timeline versions into its own file; the app also keeps older single-file (`timeline.otio`) history visible.
 
 Restoring writes the old `.otio` back and auto-imports it into the open Resolve project when the scripting API allows it; otherwise it tells you the manual `File → Import Timeline → OpenTimelineIO` steps.
 
@@ -47,9 +47,9 @@ Restoring writes the old `.otio` back and auto-imports it into the open Resolve 
 ```bash
 pip install -e .  # or uv pip install -e .
 
-# in your film folder (next to where you export timeline.otio)
+# in your film folder (next to timelines/<name>.otio)
 get-syncd init
-get-syncd save -m "rough cut v1 - 5 clips"
+get-syncd save -t 5 -m "rough cut v1 - 5 clips"
 get-syncd status        # any unsaved changes?
 get-syncd log           # history
 get-syncd diff HEAD~1 HEAD
@@ -73,7 +73,7 @@ Then:
 ```bash
 source .venv/bin/activate  # Windows: .\.venv\Scripts\Activate.ps1
 get-syncd --help
-pytest -q  # 29 passed
+pytest -q  # should pass with no failures
 ```
 
 Step-by-step per OS: [MAC_GUIDE.md](MAC_GUIDE.md) · [WINDOWS_GUIDE.md](WINDOWS_GUIDE.md) · [LINUX_GUIDE.md](LINUX_GUIDE.md)

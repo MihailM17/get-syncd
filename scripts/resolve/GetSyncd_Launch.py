@@ -27,6 +27,9 @@ from pathlib import Path
 
 API = "http://127.0.0.1:5174"
 APP_NAME = "Get Syncd"
+# Must match api_server.API_PORT_START/COUNT: the sidecar takes the first free
+# port, so locate the freshest healthy one instead of assuming 5174.
+API_PORTS = range(5174, 5184)
 
 
 def _get(url, timeout=3):
@@ -56,7 +59,7 @@ def _sidecar_candidates():
     cands = []
     if sys.platform == "darwin":
         base = Path("/Applications") / (APP_NAME + ".app") / "Contents" / "MacOS"
-        cands += [base / "get-syncd-api-aarch64-apple-darwin", base / "get-syncd-api-x86_64-apple-darwin"]
+        cands += [base / "get-syncd-api", base / "get-syncd-api-aarch64-apple-darwin", base / "get-syncd-api-x86_64-apple-darwin"]
     elif sys.platform == "win32":
         local = Path(os.environ.get("LOCALAPPDATA", ""))
         pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
@@ -69,9 +72,41 @@ def _sidecar_candidates():
     return [p for p in cands if p.is_file()]
 
 
+def _probe(port, timeout=0.8):
+    """Health of one candidate port, or None. Picks freshest on ties via started."""
+    d = None
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/health" % port, timeout=timeout) as r:
+            d = json.loads(r.read().decode() or "{}")
+    except Exception:
+        return None
+    if not d or not d.get("ok"):
+        return None
+    try:
+        started = float(d.get("started") or 0)
+    except Exception:
+        started = 0
+    return (started, port)
+
+
+def _find_api():
+    """URL of the freshest healthy sidecar across the port range, else None."""
+    best = None
+    for port in API_PORTS:
+        hit = _probe(port)
+        if hit and (best is None or hit[0] > best[0]):
+            best = hit
+    if best:
+        return "http://127.0.0.1:%d" % best[1]
+    return None
+
+
 def _ensure_sidecar():
-    if _get(API + "/health", timeout=2):
-        print("[Get Syncd] sidecar already running.")
+    global API
+    found = _find_api()
+    if found:
+        API = found
+        print("[Get Syncd] sidecar already running at %s." % API)
         return True
     cmd = None
     for p in _sidecar_candidates():
@@ -99,8 +134,10 @@ def _ensure_sidecar():
         return False
     for _ in range(30):
         time.sleep(1)
-        if _get(API + "/health", timeout=2):
-            print("[Get Syncd] sidecar is up.")
+        found = _find_api()
+        if found:
+            API = found
+            print("[Get Syncd] sidecar is up at %s." % API)
             return True
     print("[Get Syncd] sidecar did not answer within 30s.")
     return False
@@ -112,7 +149,7 @@ def _current_project_name():
         g = globals().get("bmd") or globals().get("resolve")
         if g is None:
             try:
-                from resolve_state import ensure_resolve_scripting_path  # noqa
+                from get_syncd.resolve_state import ensure_resolve_scripting_path  # noqa
 
                 ensure_resolve_scripting_path()
             except Exception:

@@ -70,7 +70,7 @@ get-syncd init
 ### Normal loop
 
 1. Edit in Resolve like you always do.
-2. Hit **Save** in Get Syncd (it auto-exports the timeline; manual fallback is `File → Export Timeline → OpenTimelineIO` → overwrite `timeline.otio`).
+2. Hit **Save** in Get Syncd (it auto-exports the timeline; manual fallback is `File → Export Timeline → OpenTimelineIO` → overwrite `timelines/<TimelineName>.otio`).
 3. Save with a note like "trimmed intro after notes" (or leave it empty and it auto-describes).
 4. Look back anytime: history list, plain-English diff, restore any version (auto-imports into Resolve when possible).
 

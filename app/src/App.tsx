@@ -1,18 +1,37 @@
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
-const API = 'http://127.0.0.1:5174'
+let API = 'http://127.0.0.1:5174'
+// Must match api_server.API_PORT_START/COUNT: the sidecar takes the first free
+// port, so probe the range and attach to the freshest healthy server instead
+// of assuming 5174 (stale orphans can squat it after an update).
+const API_PORTS = Array.from({length: 10}, (_, i) => 5174 + i)
+async function resolveApiBase(): Promise<string> {
+  const probes = API_PORTS.map(port => (async () => {
+    const ctl = new AbortController()
+    const t = window.setTimeout(() => ctl.abort(), 900)
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/health`, {signal: ctl.signal})
+      if (!r.ok) return null
+      const d = await r.json() as {ok?: boolean; started?: number}
+      if (!d?.ok) return null
+      return {port, started: Number(d.started) || 0}
+    } catch { return null } finally { window.clearTimeout(t) }
+  })())
+  const found = (await Promise.all(probes)).filter(Boolean).sort((a, b) => (b!.started - a!.started))[0]
+  return found ? `http://127.0.0.1:${found.port}` : API
+}
 // Projects folder comes from GET /api/default-repo at startup (OS-correct ~/GetSyncd).
 // Empty until resolved — the backend treats an empty repo as "use the default".
 const POLL_MS = 10000
 
-type Version = { hash: string; short: string; author: string; date: string; message: string; preview?: string; timeline?: string }
+type Version = { hash: string; short: string; author: string; date: string; message: string; preview?: string; timeline?: string; file?: string; legacy?: boolean }
 type TimelineInfo = { name: string; file: string; has_changes: boolean | null; message: string; stat?: string }
-type Status = { repo?: string; is_repo: boolean; has_changes: boolean | null; message: string; candidate?: string; current_branch?: string; branches?: string[], timelines?: TimelineInfo[], current_timeline?: string | null, all_timelines?: string[] }
+type Status = { repo?: string; is_repo: boolean; has_changes: boolean | null; message: string; notice?: string | null; candidate?: string; current_branch?: string; branches?: string[], timelines?: TimelineInfo[], current_timeline?: string | null, all_timelines?: string[] }
 type GraphCommit = { hash: string; short: string; message: string; relative?: string; date: string; lane?: number; isBranch?: boolean; isFork?: boolean; isCurrent?: boolean; branches?: string[] }
 type Graph = { ok?: boolean; current?: string; branches?: string[]; altBranch?: string | null; fork?: string | null; commits?: GraphCommit[] }
 type DiffChange = { type: string; index_old?: number | null; index_new?: number | null; clip_name?: string; kind?: string; details?: Record<string, number | string | boolean | undefined> }
-type Diff = { summary?: { added?: number; removed?: number; trimmed?: number; reordered?: number; gap_changed?: number; total_changes?: number; runtime_delta_s?: number }; changes?: DiffChange[]; warnings?: string[]; new_track?: { items?: { name?: string }[] } | null }
+type Diff = { is_first_save?: boolean; summary?: { added?: number; removed?: number; trimmed?: number; reordered?: number; gap_changed?: number; total_changes?: number; runtime_delta_s?: number }; changes?: DiffChange[]; warnings?: string[]; new_track?: { items?: { name?: string }[] } | null }
 
 export default function App() {
   const [defaultRepo, setDefaultRepo] = useState('')
@@ -38,6 +57,13 @@ export default function App() {
   const [infoModal, setInfoModal] = useState<{title:string, body:string} | null>(null)
   const [pendingForceDelete, setPendingForceDelete] = useState<string | null>(null)
   const [toast, setToast] = useState<{msg:string, type:'success'|'error'|'info'}|null>(null)
+  const [diffError, setDiffError] = useState(false)
+  const [apiDown, setApiDown] = useState(false)
+  // NOTE: all hooks must stay above every early return (Rules of Hooks).
+  const [showBranch, setShowBranch] = useState(false)
+  const [branchInput, setBranchInput] = useState('')
+  const [newBranch, setNewBranch] = useState('')
+  const [showDeleteBranch, setShowDeleteBranch] = useState<string | null>(null)
   const toastTimer = useRef<number | null>(null)
   const showToast = (msg:string, type:'success'|'error'|'info'='success') => {
     setToast({msg, type})
@@ -245,6 +271,7 @@ export default function App() {
       setStatus(s)
       if (!s.is_repo) { setShowSetup(true); return }
       setShowSetup(false)
+      setApiDown(false)
       // Determine effective timeline for this refresh — strictly per-project
       let effTimeline = timelineAtStart
       if (s.timelines) {
@@ -303,20 +330,29 @@ export default function App() {
     } catch (e) {
       if ((e as Error)?.name === 'AbortError') return
       console.error(e)
+      if (repoAtStart === repoRef.current) setApiDown(true)
     }
   }
 
-  // Resolve OS-correct ~/GetSyncd once at startup (replaces hardcoded fallback path)
+  // Resolve sidecar address (port discovery) + OS-correct ~/GetSyncd once at startup
   useEffect(() => {
     let cancelled = false
-    fetch(`${API}/api/default-repo`).then(r=>r.json()).then((d:{ok?:boolean; path?:string})=>{
+    ;(async () => {
+      try {
+        API = await resolveApiBase()
+      } catch { /* keep default 5174 */ }
       if (cancelled) return
-      if (d?.ok && d.path) {
-        setDefaultRepo(d.path)
-        setRepo(prev => (prev === '' ? d.path as string : prev))
-        setFolder(prev => (prev === '' ? d.path as string : prev))
-      }
-    }).catch(()=>{}).finally(()=>{ if (!cancelled) setRepoReady(true) })
+      try {
+        const r = await fetch(`${API}/api/default-repo`)
+        const d = await r.json() as {ok?:boolean; path?:string}
+        if (cancelled) return
+        if (d?.ok && d.path) {
+          setDefaultRepo(d.path)
+          setRepo(prev => (prev === '' ? d.path as string : prev))
+          setFolder(prev => (prev === '' ? d.path as string : prev))
+        }
+      } catch {} finally { if (!cancelled) setRepoReady(true) }
+    })()
     return ()=>{ cancelled = true }
   }, [])
 
@@ -335,14 +371,18 @@ export default function App() {
     return ()=>{ ctl.abort(); window.clearInterval(id) }
   }, [repoReady, repo, activeTimeline])
   useEffect(() => {
-    if (!selected || log.length<2) return
+    if (!selected) return
     const ctl = new AbortController()
     const idx = log.findIndex(v=>v.hash===selected.hash)
-    const a = idx+1<log.length ? log[idx+1].hash : selected.hash
-    const tl = activeTimelineRef.current ? `&timeline=${encodeURIComponent(activeTimelineRef.current)}` : ''
-    api(`/api/diff?a=${a}&b=${selected.hash}${tl}`, undefined, undefined, ctl.signal).then(d=>setDiff(d as Diff)).catch(e=>{ if ((e as Error)?.name !== 'AbortError') setDiff(null) })
+    if (idx < 0) return
+    // Oldest version in the list has no previous: compare against empty so a
+    // first save shows everything as added instead of a meaningless self-diff.
+    const a = idx+1<log.length ? log[idx+1].hash : 'empty'
+    const tl = activeTimeline ? `&timeline=${encodeURIComponent(activeTimeline)}` : ''
+    setDiffError(false)
+    api(`/api/diff?a=${a}&b=${selected.hash}${tl}`, undefined, undefined, ctl.signal).then(d=>setDiff(d as Diff)).catch(e=>{ if ((e as Error)?.name !== 'AbortError') { setDiff(null); setDiffError(true) } })
     return ()=>ctl.abort()
-  }, [selected, log.length])
+  }, [selected, log.length, activeTimeline])
 
   const doSave = async () => {
     playSound('click')
@@ -367,7 +407,7 @@ export default function App() {
     }
     setSyncStep('Checking changes...')
     const st = await api('/api/status') as Status
-    if (!st.has_changes) { playSound('pop'); showInfo('No changes to save', 'Edit in Resolve and re-export ~/GetSyncd/timeline.otio first' + (st.message?.includes('Found') ? `\n\nFound: ${st.candidate || ''}` : ''), 'info'); setSyncStep(null); return }
+    if (!st.has_changes) { playSound('pop'); const wantFile = activeTimelineRef.current && activeTimelineRef.current!=='timeline' ? `timelines/${activeTimelineRef.current}.otio` : 'timeline.otio'; showInfo('No changes to save', `Edit in Resolve, export to ${wantFile} inside the project folder, then Save again.` + (st.notice ? `\n\n⚠ ${st.notice}` : ''), 'info'); setSyncStep(null); return }
     setSyncStep('Creating version...')
     const res = await fetch(`${API}/api/save`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo, message: note || undefined, timeline: activeTimeline || undefined})}).then(r=>r.json())
     if (!res.ok) { playSound('delete'); showInfo('Save failed', res.error, 'error'); setSyncStep(null); return }
@@ -399,7 +439,7 @@ export default function App() {
     if (res.auto_import) {
       showInfo(`Restored to ${v.short}`, `${res.auto_import_msg}\n\nNo manual import needed — just play the timeline in Resolve.`, 'success')
     } else {
-      showInfo(`Restored to ${v.short}`, `${res.auto_import_msg || ''}\n\nIn Resolve: File → Import Timeline → OpenTimelineIO → timeline.otio`, 'success')
+      showInfo(`Restored to ${v.short}`, `${res.auto_import_msg || ''}\n\nIn Resolve: File → Import Timeline → OpenTimelineIO → ${res.file || 'timeline.otio'}`, 'success')
     }
   }
 
@@ -420,16 +460,25 @@ export default function App() {
   }
 
   const doSync = async () => {
+    playSound('click')
     setSyncStep('Syncing with GitHub...')
-    // naive: try push via CLI? For now just status
     try {
       const s = await api('/api/status') as Status
       if (!s.is_repo) { showInfo('No project yet', 'Create Project first', 'info'); setSyncStep(null); return }
-      // In real app, call POST /api/push
+      const r = await api('/api/push', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})}) as {ok?: boolean; error?: string; output?: string; needs_remote?: boolean}
+      if (!r?.ok) {
+        playSound('delete')
+        const hint = r?.needs_remote ? '\n\nConnect a GitHub repo first (first-run wizard or `gh repo create`), then Sync.' : ''
+        showInfo('Sync failed', `${r?.error || 'Push failed.'}${hint}\nYour local versions are safe — nothing was deleted.`, 'error')
+        setSyncStep(null)
+        return
+      }
+      playSound('success'); showToast('Synced with GitHub ✓', 'success')
       setSyncStep('Complete ✓')
+      refresh()
       setTimeout(()=>setSyncStep(null), 1200)
     } catch (e:any) {
-      showInfo('Sync failed', `Your local project has not been deleted.\n${e.message}`, 'error')
+      showInfo('Sync failed', `Your local versions are safe — nothing was deleted.\n${e.message}`, 'error')
       setSyncStep(null)
     }
   }
@@ -440,6 +489,9 @@ export default function App() {
     else { setRepo(folder); setShowSetup(false); refresh() }
   }
 
+  const baseChanges = (diff?.changes || []).filter(c=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap'))
+  // First save: gaps are just spacing in a brand-new timeline, not changes worth listing.
+  const visChanges = diff?.is_first_save ? baseChanges.filter(c=> c.kind!=='gap') : baseChanges
   const groups: Record<string, Version[]> = {}
   const today = new Date().toISOString().slice(0,10)
   const yest = new Date(Date.now()-864e5).toISOString().slice(0,10)
@@ -490,10 +542,6 @@ export default function App() {
     )
   }
 
-  const [showBranch, setShowBranch] = useState(false)
-  const [branchInput, setBranchInput] = useState('')
-  const [newBranch, setNewBranch] = useState('')
-  const [showDeleteBranch, setShowDeleteBranch] = useState<string | null>(null)
   const switchBranch = () => {
     setBranchInput(status?.current_branch || 'main')
     setNewBranch('')
@@ -553,6 +601,8 @@ export default function App() {
       </header>
 
       {syncStep && <div className="syncbar">{syncStep}</div>}
+      {status?.notice && <div className="syncbar">⚠ {status.notice}</div>}
+      {apiDown && <div className="syncbar">⚠ Can’t reach the helper service — is Get Syncd running? Retrying…</div>}
 
       <div className="tabs">
         <div className="tabList">
@@ -594,8 +644,8 @@ export default function App() {
   </svg>
 </div>
                   <div className="meta">
-                    <div className="msg" style={{display:'flex', gap:'6px', alignItems:'center'}}><span style={{flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}>{v.message}</span>{!activeTimeline && v.timeline && v.timeline!=='timeline' ? <span style={{background:'var(--panel)', border:'1px solid var(--border)', color:'var(--muted)', padding:'1px 5px', borderRadius:'999px', fontSize:'10px', flexShrink:0}}>{v.timeline}</span> : null}</div>
-                    <div className="sub">{v.date} • {v.short} {!activeTimeline && v.timeline && v.timeline!=='timeline' ? `• ${v.timeline}` : ''}</div>
+                    <div className="msg" style={{display:'flex', gap:'6px', alignItems:'center'}}><span style={{flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}>{v.message}</span>{!activeTimeline && v.timeline && v.timeline!=='timeline' ? <span style={{background:'var(--panel)', border:'1px solid var(--border)', color:'var(--muted)', padding:'1px 5px', borderRadius:'999px', fontSize:'10px', flexShrink:0}}>{v.timeline}</span> : null}{v.legacy ? <span title="Saved before per-timeline versions existed — shared history, may belong to any timeline" style={{background:'transparent', border:'1px dashed var(--border)', color:'var(--muted2)', padding:'1px 5px', borderRadius:'999px', fontSize:'10px', flexShrink:0}}>shared</span> : null}</div>
+                    <div className="sub">{v.date} • {v.short} {!activeTimeline && v.timeline && v.timeline!=='timeline' ? `• ${v.timeline}` : ''}{v.legacy ? ' • shared history' : ''}</div>
                   </div>
                   <button className="delBtn" title="Delete this version" aria-label={`Delete version ${v.short} (${v.message})`} onClick={(e)=>{e.stopPropagation(); doDelete(v)}}>×</button>
                 </div>
@@ -612,8 +662,8 @@ export default function App() {
               <div className="detailHead" style={{flexDirection:'column', alignItems:'center', textAlign:'center'}}>
                 <div style={{width:'100%'}}>
                   <h2 style={{textAlign:'center'}}>{selected.message}</h2>
-                  <p className="vs" style={{fontWeight:500, color:'var(--text)', textAlign:'center'}}>{diff ? humanSummary(diff.summary) : 'Loading changes...'}</p>
-                  <p className="muted" style={{padding:0, fontSize:'12px', marginTop:'4px', textAlign:'center'}}>vs previous • {selected.date} • {selected.short}</p>
+                  <p className="vs" style={{fontWeight:500, color:'var(--text)', textAlign:'center'}}>{diff ? humanSummary(diff.summary) : diffError ? 'Couldn’t compare these versions — reselect to retry.' : 'Loading changes...'}</p>
+                  <p className="muted" style={{padding:0, fontSize:'12px', marginTop:'4px', textAlign:'center'}}>{diff?.is_first_save ? 'First save' : 'vs previous'} • {selected.date} • {selected.short}</p>
                 </div>
               </div>
               {diff && <div className="barWrap" style={{width:'100%'}}>
@@ -626,21 +676,21 @@ export default function App() {
                 </div>
                 <div className="legend"><span className="l u" /> Unchanged <span className="l t" /> Trimmed <span className="l r" /> Removed <span className="l a" /> Added</div>
               </div>}
-              <div className="summaryText">{diff ? humanSummary(diff.summary) : 'Comparing...'}</div>
+              <div className="summaryText">{diff ? humanSummary(diff.summary) : diffError ? 'Comparison unavailable.' : 'Comparing...'}</div>
               <div style={{display:'flex', justifyContent:'flex-start', marginBottom:'16px'}}>
                 <button className="ghost" onClick={()=>{playSound('click'); doRestore(selected)}}>Restore</button>
               </div>
               <div className="changes">
-                <h3>What changed</h3>
-                {diff?.changes?.length ? (showAllChanges ? diff.changes.filter(c=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap')) : diff.changes.filter(c=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap')).slice(0,10)).map((c,i:number)=>(
+                <h3>{diff?.is_first_save ? "What's in this save" : 'What changed'}</h3>
+                {visChanges.length ? (showAllChanges ? visChanges : visChanges.slice(0,10)).map((c,i:number)=>(
                   <div key={i} className={`change ${c.type}`}><span className="dot2" /> <span>{humanChange(c)}</span></div>
-                )) : <div className="muted">No clip changes — maybe just a gap or timing tweak</div>}
-                {diff?.changes && diff.changes.filter(c=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap')).length > 10 && (
-                  <button className="ghost" style={{marginTop:'8px'}} onClick={()=>setShowAllChanges(v=>!v)}>{showAllChanges ? 'Show less' : `Show all ${diff.changes.filter(c=> c.type!=='gap_changed' || !c.clip_name?.startsWith('Gap')).length} changes`}</button>
+                )) : <div className="muted">{diff?.is_first_save ? 'Empty save — no clips in this version' : 'No clip changes — maybe just a gap or timing tweak'}</div>}
+                {visChanges.length > 10 && (
+                  <button className="ghost" style={{marginTop:'8px'}} onClick={()=>setShowAllChanges(v=>!v)}>{showAllChanges ? 'Show less' : `Show all ${visChanges.length} changes`}</button>
                 )}
                 {diff && (
                   <div className="notes">
-                    {(diff.changes?.filter(c=> c.clip_name?.startsWith('Gap')).length || 0)>0 && (
+                    {!diff.is_first_save && (diff.changes?.filter(c=> c.clip_name?.startsWith('Gap')).length || 0)>0 && (
                       <div className="note gap-note">• {diff.changes?.filter(c=>c.clip_name?.startsWith('Gap')).length} gap{(diff.changes?.filter(c=>c.clip_name?.startsWith('Gap')).length || 0)>1?'s':''} tweaked — usually just spacing, safe to ignore</div>
                     )}
                     {diff?.warnings?.length ? (
@@ -745,7 +795,7 @@ export default function App() {
         <div className="modalBg" onClick={()=>setShowSave(false)}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
             <h3>Save Version</h3>
-            <p className="muted">This will create a new version from {repo}/timeline.otio</p>
+            <p className="muted">This will create a new version from {repo}/{activeTimeline && activeTimeline!=='timeline' ? `timelines/${activeTimeline}.otio` : 'timeline.otio'}</p>
             <textarea value={note} onChange={e=>setNote(e.target.value)} placeholder="Audio cleanup — trimmed intro, added B-roll" rows={3} />
             <div className="modalActions">
               <button onClick={()=>setShowSave(false)}>Cancel</button>
@@ -898,7 +948,7 @@ export default function App() {
 
 function FirstRunWizard(props: {
   defaultRepo: string
-  api: (path: string, opts?: RequestInit) => Promise<any>
+  api: (path: string, opts?: RequestInit, repoOverride?: string, signal?: AbortSignal) => Promise<any>
   notify: (title: string, body: string, type?: 'success'|'error'|'info') => void
   click: (type?: 'click'|'success'|'delete'|'pop') => void
   onDismiss: () => void
@@ -946,7 +996,9 @@ function FirstRunWizard(props: {
     setBusy(true)
     try {
       const target = `${defaultRepo}/${name}`
-      await api('/api/init', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: target})})
+      // repoOverride keeps the ?repo= query consistent with the body.
+      const r = await api('/api/init', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: target})}, target) as {ok?: boolean; error?: string}
+      if (!r?.ok) throw new Error(r?.error || 'Could not create project.')
       setCreatedPath(target)
       if (!ghName) setGhName(name)
       click('success')
@@ -962,7 +1014,8 @@ function FirstRunWizard(props: {
     if (!createdPath) return
     setBusy(true)
     try {
-      const r = await api('/api/github/create', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: createdPath, name: ghName.trim(), private: ghPrivate})}) as {ok?:boolean; url?:string}
+      const r = await api('/api/github/create', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo: createdPath, name: ghName.trim(), private: ghPrivate})}, createdPath) as {ok?:boolean; url?:string; error?:string}
+      if (!r?.ok) throw new Error(r?.error || 'Could not create repo.')
       if (r.url) setGhUrl(r.url)
       click('success')
     } catch (e) {

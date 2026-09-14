@@ -4,8 +4,12 @@ import subprocess
 import shutil
 import sys
 sys.path.insert(0, "src")
-from get_syncd import git_store
+from get_syncd import api, git_store
 from get_syncd.otio_parse import parse_otio_file
+
+
+def _allow_tmp(monkeypatch):
+    monkeypatch.setattr(api, "is_repo_allowed", lambda repo: True)
 
 
 def test_save_status_log_restore(tmp_path=None):
@@ -52,3 +56,48 @@ def test_save_status_log_restore(tmp_path=None):
         a = parse_otio_file(out)
         b = parse_otio_file("tests/fixtures/base.otio")
         assert len(a.main_track().items) == len(b.main_track().items)
+
+
+def test_current_previews_dont_collide():
+    import tempfile
+    from get_syncd import preview
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp) / "repo"
+        (repo / ".get-syncd" / "previews").mkdir(parents=True)
+        shutil.copy("tests/fixtures/base.otio", str(repo / "a.otio"))
+        shutil.copy("tests/fixtures/trimmed_early.otio", str(repo / "b.otio"))
+        pa = preview.generate_preview(repo, "current-" + git_store.file_hash(repo / "a.otio"), repo / "a.otio")
+        pb = preview.generate_preview(repo, "current-" + git_store.file_hash(repo / "b.otio"), repo / "b.otio")
+        assert pa != pb, "live previews must not share one file"
+        assert pa.exists() and pa.stat().st_size > 100
+        assert pb.exists() and pb.stat().st_size > 100
+
+
+def test_push_to_local_remote(monkeypatch):
+    _allow_tmp(monkeypatch)
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp) / "repo"
+        repo.mkdir()
+        shutil.copy("tests/fixtures/base.otio", str(repo / "timeline.otio"))
+        git_store.init_repo(repo)
+        h1 = git_store.save_version(repo, repo / "timeline.otio", "Initial cut")
+        bare = pathlib.Path(tmp) / "remote.git"
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+        git_store._run_git(["remote", "add", "origin", str(bare)], cwd=repo)
+        res = api.api_push(repo)
+        assert res["ok"], res
+        # remote really received the commit
+        r = git_store._run_git(["log", "--pretty=format:%H"], cwd=bare, check=False)
+        assert h1 in r.stdout
+
+
+def test_push_without_remote_is_actionable(monkeypatch):
+    _allow_tmp(monkeypatch)
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp) / "repo"
+        repo.mkdir()
+        git_store.init_repo(repo)
+        res = api.api_push(repo)
+        assert res["ok"] is False
+        assert res.get("needs_remote") is True
+        assert "remote" in res["error"].lower()

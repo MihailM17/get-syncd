@@ -2,9 +2,14 @@
 
 _get_resolve_timelines is read-only: cache-first, and live reads only apply
 when the open project name matches the repo folder name. No LoadProject calls.
+Restore auto-import must also never CloseProject/LoadProject: SetCurrentTimeline
+plus SaveProject is enough, the user reopens manually if ever needed.
 """
 
 import inspect
+import shutil
+import sys
+import types
 from pathlib import Path
 
 from get_syncd import resolve_state, api
@@ -49,3 +54,83 @@ def test_live_state_ignored_when_project_mismatch(tmp_path, monkeypatch):
     )
     cur, names = api._get_resolve_timelines(r)
     assert (cur, names) == (None, [])
+
+
+class _FakeTimeline:
+    def GetName(self):
+        return "5"
+
+
+class _FakeMediaPool:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def ImportTimelineFromFile(self, path, opts):
+        self.calls.append(("import", str(path)))
+        return _FakeTimeline()
+
+
+class _FakeProject:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def GetName(self):
+        return "Proj"
+
+    def GetMediaPool(self):
+        return _FakeMediaPool(self.calls)
+
+    def SetCurrentTimeline(self, tl):
+        self.calls.append(("set_current", True))
+
+
+class _FakePM:
+    def __init__(self):
+        self.calls = []
+
+    def GetCurrentProject(self):
+        return _FakeProject(self.calls)
+
+    def SaveProject(self):
+        self.calls.append(("save_project",))
+
+    def CloseProject(self, project):
+        self.calls.append(("close_project",))
+        raise AssertionError("restore must never close the user's project")
+
+    def LoadProject(self, name):
+        self.calls.append(("load_project",))
+        raise AssertionError("restore must never load/switch projects")
+
+
+def test_restore_never_closes_or_reopens_project(tmp_path, monkeypatch):
+    from get_syncd import git_store
+
+    monkeypatch.setattr(api, "is_repo_allowed", lambda repo: True)
+    fake_mod = types.ModuleType("DaVinciResolveScript")
+    fake_pm = _FakePM()
+
+    class _FakeResolve:
+        def GetProjectManager(self):
+            return fake_pm
+
+    fake_mod.scriptapp = lambda name: _FakeResolve()
+    monkeypatch.setitem(sys.modules, "DaVinciResolveScript", fake_mod)
+
+    repo = tmp_path / "Proj"
+    (repo / "timelines").mkdir(parents=True)
+    git_store.init_repo(repo)
+    fixture = Path(__file__).parent / "fixtures" / "base.otio"
+    t5 = repo / "timelines" / "5.otio"
+    shutil.copy(str(fixture), str(t5))
+    h = git_store.save_version(repo, t5, "Save 5", timeline_dest="timelines/5.otio")
+
+    res = api.api_restore(repo, rev=h, apply=True, timeline="5")
+    assert res["ok"], res
+    assert ("save_project",) in fake_pm.calls
+    assert ("set_current", True) in fake_pm.calls
+    kinds = [k for k, *_ in fake_pm.calls]
+    assert "close_project" not in kinds and "load_project" not in kinds
+
+    src = inspect.getsource(api._try_resolve_import)
+    assert ".CloseProject(" not in src and ".LoadProject(" not in src

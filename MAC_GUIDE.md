@@ -6,7 +6,7 @@ You don’t need to know git. If you can export a timeline in Resolve and type a
 
 Instead of `Film_v1.drp`, `Film_v2_FINAL.drp`, you do:
 
-`File → Export Timeline → OpenTimelineIO → timeline.otio` → `get-syncd save`
+`File → Export Timeline → OpenTimelineIO → timelines/5.otio` (use your timeline's number) → `get-syncd save -t 5`
 
 Now you have a history. `get-syncd log` shows it, `diff` tells you in plain English what changed, `restore` gives you an `.otio` to re-import. Media never leaves your drive.
 
@@ -67,11 +67,11 @@ get-syncd init
 ### Normal loop
 
 1. Edit in Resolve like you always do.
-2. Export: `File → Export Timeline → OpenTimelineIO` → overwrite `timeline.otio` in your project folder.
-3. Save: `get-syncd save -m "trimmed intro after notes"` (or just `get-syncd save` and it auto-describes).
-4. Check: `get-syncd status` — tells you if you exported but forgot to save.
-5. Look back: `get-syncd log`, `get-syncd diff HEAD~1 HEAD`, `get-syncd view`.
-6. Go back: `get-syncd restore HEAD~2 --out /tmp/old.otio` → in Resolve `File → Import Timeline → OpenTimelineIO → /tmp/old.otio`. Or `get-syncd restore 2 --apply` to overwrite `timeline.otio` directly.
+2. Export: `File → Export Timeline → OpenTimelineIO` → overwrite `timelines/5.otio` in your project folder (use your timeline's number).
+3. Save: `get-syncd save -t 5 -m "trimmed intro after notes"` (or just `get-syncd save -t 5` and it auto-describes).
+4. Check: `get-syncd status -t 5` — tells you if you exported but forgot to save.
+5. Look back: `get-syncd log -t 5`, `get-syncd diff HEAD~1 HEAD`, `get-syncd view`.
+6. Go back: `get-syncd restore HEAD~2 --out /tmp/old.otio` → in Resolve `File → Import Timeline → OpenTimelineIO` → /tmp/old.otio. Or `get-syncd restore 2 --apply -t 5` to overwrite `timelines/5.otio` directly.
 
 Optional backup:
 
@@ -90,14 +90,14 @@ You can test the diff engine with no video:
 ```bash
 cd ~/get-syncd
 source .venv/bin/activate
-pytest -q  # should say 27 passed
+pytest -q  # should pass with no failures
 ```
 
 ### If it complains
 
 - `command not found: get-syncd` → run `source .venv/bin/activate` in that window
 - `Not a git repo — run get-syncd init` → `cd ~/GetSyncd/MyFilm` first
-- `No timeline.otio yet` → you haven’t exported yet
+- `No timeline file found` / `No export found` → you haven’t exported yet (must land in `timelines/<name>.otio`)
 - `No changes to save` → the file is identical to last save
 - Import looks empty → relink media in Resolve’s Media Pool (media paths are absolute)
 

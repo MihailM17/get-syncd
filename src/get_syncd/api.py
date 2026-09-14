@@ -6,6 +6,7 @@ Preserves core: Resolve → OTIO → git → GitHub, media stays local.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -45,6 +46,15 @@ def is_repo_allowed(repo: str | Path | None) -> bool:
         return p == base or base in p.parents
     except Exception:
         return False
+
+
+def _require_allowed_repo(repo: Path) -> dict | None:
+    """Enforce the trust boundary at the api.* layer (not just the HTTP layer),
+    so direct/CLI/embedded callers can't mkdir/commit/restore outside ~/GetSyncd.
+    Returns an error dict when rejected, else None."""
+    if not is_repo_allowed(repo):
+        return {"ok": False, "error": "Repo outside ~/GetSyncd not allowed", "repo": str(repo)}
+    return None
 
 
 def api_get_current_resolve() -> dict:
@@ -142,8 +152,22 @@ def _resolve_repo(repo: str | Path | None) -> Path:
         p = p.parent
     return p.resolve()
 
+def _alias_versions(repo: Path, tfile: str | None, limit: int) -> list[dict]:
+    """History for numeric (1 = latest) alias resolution.
+
+    Strictly scoped to the timeline's file, matching exactly what the History
+    list shows: no all-commits fallback, so "1" in an untouched timeline
+    resolves to nothing instead of another timeline's version.
+    """
+    if tfile:
+        return git_store.log_versions(repo, limit=limit, timeline_file=tfile, fallback=False)
+    return git_store.log_versions(repo, limit=limit, timeline_file=None)
+
 def api_init(repo: str | Path | None = None, remote: str | None = None) -> dict:
     r = _resolve_repo(repo)
+    denied = _require_allowed_repo(r)
+    if denied:
+        return denied
     r.mkdir(parents=True, exist_ok=True)
     git_store.init_repo(r, remote_url=remote)
     return {"ok": True, "repo": str(r), "remote": remote}
@@ -297,6 +321,30 @@ def api_status(repo: str | Path | None = None) -> dict:
         tf = _get_timeline_file(r, name if name != "timeline" else None)
         # For legacy, use git_store.status with specific file
         rel = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
+        if not tf.exists():
+            # No working file: either never exported (not a change) or deleted
+            # (real change). Never fall back to another timeline's file here —
+            # an untouched timeline must not report other timelines' activity.
+            hist = git_store._run_git(["log", "--all", "--", rel], cwd=r, check=False)
+            if not hist.stdout.strip():
+                timelines_status.append({
+                    "name": name,
+                    "file": rel,
+                    "has_changes": None,
+                    "message": "Not yet exported",
+                    "stat": "",
+                })
+                continue
+            any_has_changes = True
+            overall_msg = f"'{name}' was deleted from the folder"
+            timelines_status.append({
+                "name": name,
+                "file": rel,
+                "has_changes": True,
+                "message": f"'{rel}' is missing — restore a version to bring it back",
+                "stat": "",
+            })
+            continue
         res = git_store.status(r, timeline_file=rel)
         has = res.get("has_changes")
         if has is True:
@@ -323,6 +371,27 @@ def api_status(repo: str | Path | None = None) -> dict:
         if not any_has_changes:
             # Check if any file is missing but should exist
             pass
+    # Stray legacy file: once migrated to timelines/*.otio, the root
+    # timeline.otio is legacy storage shadowed by every pill — a misdirected
+    # export landing there would otherwise be invisible. Surface it loudly.
+    notice = None
+    try:
+        migrated = timelines_dir.exists() and any(timelines_dir.glob("*.otio"))
+        legacy = r / "timeline.otio"
+        if migrated and legacy.exists():
+            st_leg = git_store.status(r, timeline_file="timeline.otio")
+            if st_leg.get("has_changes") is True:
+                where = f"timelines/{_sanitize_timeline_name(cur)}.otio" if cur else "timelines/<name>.otio"
+                notice = (
+                    f"timeline.otio in the project root has unsaved changes — "
+                    f"it is legacy storage, so no timeline button shows it. "
+                    f"Exports belong in {where}: re-export the current timeline there, then Save."
+                )
+                any_has_changes = True
+                overall_msg = "Root timeline.otio has unsaved changes"
+                overall_stat = st_leg.get("stat", "")
+    except Exception as e:
+        log.warning("stray legacy check failed for %s: %s", r, e)
     branches = []
     cur_branch = ""
     try:
@@ -343,6 +412,7 @@ def api_status(repo: str | Path | None = None) -> dict:
         "is_repo": True if (r / ".git").exists() else False,
         "has_changes": has_changes_overall,
         "message": overall_msg,
+        "notice": notice,
         "stat": overall_stat,
         "branches": branches,
         "current_branch": cur_branch,
@@ -367,6 +437,10 @@ def api_timelines(repo: str | Path | None = None) -> dict:
         # If legacy file and we have a current, use current name
         if f.name == "timeline.otio" and cur and len(all_names) > 1:
             name = cur
+            # Once migrated, timelines/<current>.otio is the live file — listing
+            # the legacy file too would show the same timeline twice.
+            if (timelines_dir / f"{_sanitize_timeline_name(cur)}.otio").exists():
+                continue
         st = git_store.status(r, timeline_file=rel)
         timelines.append({"name": name, "file": rel, "has_changes": st.get("has_changes"), "message": st.get("message", "")})
     # Add Resolve timelines not yet exported
@@ -386,35 +460,53 @@ def api_log(repo: str | Path | None = None, limit: int = 20, timeline: str | Non
     except Exception:
         return []
     # Determine timeline file for log
-    tf = None
     if timeline:
+        # Per-timeline view: STRICTLY this timeline's file. Legacy
+        # timeline.otio saves live in the All view only — mixing them into
+        # every pill made untouched timelines show other timelines' saves.
+        # (When the repo hasn't migrated, _get_timeline_file already resolves
+        # to timeline.otio, so single-file projects keep working unchanged.)
         try:
             tf = _get_timeline_file(r, timeline)
             rel = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
-            check = git_store._run_git(["log", "--all", "--", rel], cwd=r, check=False)
         except Exception:
             return []
-        if not check.stdout.strip():
-            versions = []
-        else:
-            versions = git_store.log_versions(r, limit=limit, timeline_file=rel)
+        versions = git_store.log_versions(r, limit=limit, timeline_file=rel, fallback=False)
+        out = []
+        for v in versions:
+            files = git_store.commit_otio_files(r, v["hash"])
+            p = _preview_path(r, v["hash"])
+            out.append({
+                **v,
+                "preview": str(p) if p.exists() else None,
+                "timeline": timeline,
+                "file": files[0] if files else rel,
+                "legacy": False,
+            })
+        return out
     else:
-        # No timeline filter (All view): return log across all timeline files for this repo.
-        # Strictly per-repo, never across projects.
-        timelines_dir = r / "timelines"
-        if timelines_dir.exists() and any(timelines_dir.glob("*.otio")):
-            # Log across all timelines/*.otio for this repo
-            versions = git_store.log_versions(r, limit=limit, timeline_file="timelines/*.otio")
-            if not versions:
-                versions = git_store.log_versions(r, limit=limit)
-        else:
-            # Legacy single-file or no timelines folder — show all commits for this repo
-            versions = git_store.log_versions(r, limit=limit)
+        # No timeline filter (All view): every commit in this repo, newest-first.
+        # Strictly per-repo, never across projects. Each version carries the
+        # timeline it was saved for (when attributable) so nothing is hidden.
+        versions = git_store.log_versions(r, limit=limit, timeline_file=None)
     # enrich with preview path
     out = []
     for v in versions:
+        files = git_store.commit_otio_files(r, v["hash"])
+        tl = None
+        for f in files:
+            if f.startswith("timelines/") and f.lower().endswith(".otio"):
+                tl = Path(f).stem
+                break
+        is_legacy = bool(files) and all(f == "timeline.otio" for f in files)
         p = _preview_path(r, v["hash"])
-        out.append({**v, "preview": str(p) if p.exists() else None, "timeline": timeline or (tf.stem if tf else None)})
+        out.append({
+            **v,
+            "preview": str(p) if p.exists() else None,
+            "timeline": tl,
+            "file": files[0] if files else None,
+            "legacy": is_legacy,
+        })
     return out
 
 def api_graph(repo: str | Path | None = None) -> dict:
@@ -441,12 +533,16 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
         rev = rev.strip()
         if rev.isdigit():
             n = int(rev)
-            vers = git_store.log_versions(r, limit=max(20, n), timeline_file=tfile) if tfile else git_store.log_versions(r, limit=max(20, n))
+            vers = _alias_versions(r, tfile, max(20, n))
             if 0 <= n-1 < len(vers):
                 return vers[n-1]["hash"]
         return rev
     a2 = _alias(a)
     b2 = _alias(b)
+    # First-save mode: `a` empty (or same as `b`) means "compare against an
+    # empty timeline" — a first save has no previous version, so the view shows
+    # everything in it as added instead of a meaningless self-comparison.
+    first_save = (a2 == b2) or (a or "").strip().lower() in ("", "empty", "none", "null")
     # materialize
     def _rev_to_file(rev: str) -> Path:
         p = Path(rev)
@@ -473,19 +569,36 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
                 except Exception:
                     raise e2
         return tp
+    pa = None
+    pb = None
     try:
-        pa = _rev_to_file(a2)
-        pb = _rev_to_file(b2)
-        old = parse_otio_file(pa)
-        new = parse_otio_file(pb)
+        from .otio_parse import NormalizedTimeline
+        from .diff import format_text
+        if first_save:
+            old = NormalizedTimeline(name="Empty", tracks=[])
+            pb = _rev_to_file(b2)
+            new = parse_otio_file(pb)
+        else:
+            pa = _rev_to_file(a2)
+            pb = _rev_to_file(b2)
+            old = parse_otio_file(pa)
+            new = parse_otio_file(pb)
         d = diff_timelines(old, new)
-        # build viewer data for React bar
+        # build viewer data for React bar (scoped to this timeline's file so
+        # per-timeline bars work; guarded so a viewer failure never kills the diff)
         from .viewer.app import build_viewer_data
-        vd = build_viewer_data(r, a, b)
+        try:
+            vd = build_viewer_data(r, b2 if first_save else a2, b2, tfile or "timeline.otio")
+        except Exception as ve:
+            log.warning("viewer data failed for %s (timeline %s): %s", r, timeline, ve)
+            vd = {}
+        if first_save:
+            vd = {**vd, "text_log": format_text(d, old_name="empty timeline", new_name=b2)}
         return {
             "repo": str(r),
             "a": a, "b": b,
             "a_resolved": a2, "b_resolved": b2,
+            "is_first_save": first_save,
             "summary": d.summary,
             "changes": [c.to_dict() for c in d.changes],
             "warnings": d.warnings,
@@ -503,18 +616,7 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
             "repo": str(r),
             "a": a, "b": b,
             "a_resolved": a2, "b_resolved": b2,
-            "summary": {"added":0,"removed":0,"trimmed":0,"reordered":0,"total_changes":0,"old_duration_s":0,"new_duration_s":0,"runtime_delta_s":0},
-            "changes": [],
-            "warnings": [f"Diff not available for timeline '{timeline}' — {e}"],
-            "tracks_compared": [],
-            "changelog": "No diff",
-            "new_track": None,
-            "text_log": "",
-        }
-        return {
-            "repo": str(r),
-            "a": a, "b": b,
-            "a_resolved": a2, "b_resolved": b2,
+            "is_first_save": first_save,
             "summary": {"added":0,"removed":0,"trimmed":0,"reordered":0,"total_changes":0,"old_duration_s":0,"new_duration_s":0,"runtime_delta_s":0},
             "changes": [],
             "warnings": [f"Diff not available for timeline '{timeline}' — {e}"],
@@ -526,14 +628,16 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
     finally:
         for p in (pa, pb):
             try:
-                if 'pa' in locals() and 'pb' in locals():
-                    if p.exists() and p.suffix == ".otio" and "/tmp" in str(p):
-                        p.unlink(missing_ok=True)
+                if p is not None and p.exists() and p.suffix == ".otio" and "/tmp" in str(p):
+                    p.unlink(missing_ok=True)
             except Exception:
                 pass
 
 def api_save(repo: str | Path | None = None, file: str | Path | None = None, message: str | None = None, timeline: str | None = None, all_timelines: bool = False) -> dict:
     r = _resolve_repo(repo)
+    denied = _require_allowed_repo(r)
+    if denied:
+        return denied
     if not r.exists():
         r.mkdir(parents=True, exist_ok=True)
     # If all_timelines, save every dirty timeline
@@ -618,7 +722,8 @@ def api_save(repo: str | Path | None = None, file: str | Path | None = None, mes
                 except Exception:
                     pass
             else:
-                return {"ok": False, "error": "No timeline.otio yet — export from Resolve first: File → Export Timeline → OpenTimelineIO → ~/GetSyncd/timeline.otio"}
+                hint = f"timelines/{_sanitize_timeline_name(tname)}.otio" if tname else "timelines/<name>.otio"
+                return {"ok": False, "error": f"No export found — export from Resolve first: File → Export Timeline → OpenTimelineIO → {hint} inside the project folder"}
     if not src or not Path(src).exists():
         return {"ok": False, "error": f"File not found: {src}"}
     # auto message if none
@@ -680,6 +785,9 @@ def api_save(repo: str | Path | None = None, file: str | Path | None = None, mes
 
 def api_restore(repo: str | Path | None = None, rev: str = "HEAD", apply: bool = False, out: str | Path | None = None, timeline: str | None = None) -> dict:
     r = _resolve_repo(repo)
+    denied = _require_allowed_repo(r)
+    if denied:
+        return denied
     if not rev:
         return {"ok": False, "error": "No revision given"}
     # Determine timeline file for restore
@@ -711,13 +819,29 @@ def api_restore(repo: str | Path | None = None, rev: str = "HEAD", apply: bool =
             n = int(rv)
             # Use timeline-specific log if we have it
             try:
-                vers = git_store.log_versions(r, limit=max(20, n), timeline_file=tfile)
+                vers = _alias_versions(r, tfile, max(20, n))
             except Exception:
-                vers = git_store.log_versions(r, limit=max(20, n))
+                vers = git_store.log_versions(r, limit=max(20, n), timeline_file=None)
             if 0 <= n-1 < len(vers):
                 return vers[n-1]["hash"]
         return rv
     rev_resolved = _alias(str(rev))
+    # Legacy single-file versions (timeline.otio) predate per-timeline files and
+    # are listed under every timeline filter — fall back to them when the
+    # timeline-specific file is not in the requested revision (mirrors api_diff).
+    candidate_files = [tfile] if tfile == "timeline.otio" else [tfile, "timeline.otio"]
+
+    def _restore_to(out_path: Path) -> str:
+        last_err: Exception | None = None
+        for cand in candidate_files:
+            try:
+                git_store.restore_version(r, rev_resolved, out_path, timeline_file=cand)
+                return cand
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err if last_err else ValueError(f"Version not found: {rev}")
+
     try:
         if apply:
             # safety snapshot if has changes for this timeline
@@ -741,16 +865,16 @@ def api_restore(repo: str | Path | None = None, rev: str = "HEAD", apply: bool =
                 import shutil, datetime
                 bdir = r / ".get-syncd" / "backups"
                 bdir.mkdir(parents=True, exist_ok=True)
-                ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
                 safe_name = Path(tfile).stem
                 shutil.copy2(str(out_path), str(bdir / f"{safe_name}-{ts}.otio"))
-            git_store.restore_version(r, rev_resolved, out_path, timeline_file=tfile)
+            restored_from = _restore_to(out_path)
             auto_import_ok, auto_import_msg = _try_resolve_import(out_path)
-            return {"ok": True, "rev": rev, "resolved": rev_resolved, "out": str(out_path), "applied": True, "safety": safety, "repo": str(r), "timeline": tname, "file": tfile, "auto_import": auto_import_ok, "auto_import_msg": auto_import_msg}
+            return {"ok": True, "rev": rev, "resolved": rev_resolved, "out": str(out_path), "applied": True, "safety": safety, "repo": str(r), "timeline": tname, "file": tfile, "restored_from": restored_from, "auto_import": auto_import_ok, "auto_import_msg": auto_import_msg}
         else:
             out_path = Path(out).expanduser() if out else Path(f"version-{rev}.otio")
-            git_store.restore_version(r, rev_resolved, out_path, timeline_file=tfile)
-            return {"ok": True, "rev": rev, "resolved": rev_resolved, "out": str(out_path.resolve()), "applied": False, "repo": str(r), "timeline": tname, "file": tfile}
+            restored_from = _restore_to(out_path)
+            return {"ok": True, "rev": rev, "resolved": rev_resolved, "out": str(out_path.resolve()), "applied": False, "repo": str(r), "timeline": tname, "file": tfile, "restored_from": restored_from}
     except Exception as e:
         return {"ok": False, "error": str(e), "repo": str(r)}
 
@@ -765,6 +889,9 @@ def api_branches(repo: str | Path | None = None) -> dict:
 
 def api_create_branch(repo: str | Path | None = None, name: str = "") -> dict:
     r = _resolve_repo(repo)
+    denied = _require_allowed_repo(r)
+    if denied:
+        return denied
     if not name or not name.strip():
         return {"ok": False, "error": "Branch name required"}
     name = name.strip()
@@ -782,6 +909,9 @@ def api_create_branch(repo: str | Path | None = None, name: str = "") -> dict:
 
 def api_delete_branch(repo: str | Path | None = None, name: str = "", force: bool = False) -> dict:
     r = _resolve_repo(repo)
+    denied = _require_allowed_repo(r)
+    if denied:
+        return denied
     if not name or not name.strip():
         return {"ok": False, "error": "Branch name required"}
     name = name.strip()
@@ -810,6 +940,60 @@ def api_delete_branch(repo: str | Path | None = None, name: str = "", force: boo
         return {"ok": False, "error": str(e)}
 
 
+def api_push(repo: str | Path | None = None, remote: str = "origin", branch: str | None = None) -> dict:
+    """Push this project's versions to GitHub (or any git remote).
+
+    Never hangs waiting for credentials: GIT_TERMINAL_PROMPT=0 plus a 90s
+    timeout. Missing remotes/upstream produce actionable errors, not tracebacks.
+    """
+    r = _resolve_repo(repo)
+    denied = _require_allowed_repo(r)
+    if denied:
+        return denied
+    if not git_store.is_git_repo(r):
+        return {"ok": False, "error": "Not a Get Syncd project yet — create it first.", "repo": str(r)}
+    try:
+        if branch is None:
+            br = git_store._run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=r, check=False)
+            branch = br.stdout.strip() or "main"
+            if branch == "HEAD":
+                branch = "main"
+    except Exception:
+        branch = branch or "main"
+    try:
+        rems = git_store._run_git(["remote"], cwd=r, check=False)
+    except Exception:
+        rems = None
+    if not rems or not rems.stdout.strip():
+        return {
+            "ok": False, "repo": str(r),
+            "error": "No GitHub remote connected yet — create one (first-run wizard or `gh repo create`), then Sync.",
+            "needs_remote": True,
+        }
+    if remote not in (rems.stdout.split() if rems else []):
+        return {"ok": False, "repo": str(r), "error": f"No remote named '{remote}' — connected: {', '.join(rems.stdout.split()) or 'none'}."}
+    try:
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        p = subprocess.run(
+            ["git", "push", remote, branch], cwd=str(r), capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=90, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "repo": str(r), "error": "Push timed out after 90s — check your network and retry."}
+    except Exception as e:
+        log.warning("push failed for %s: %s", r, e)
+        return {"ok": False, "repo": str(r), "error": f"Could not run git push: {e}"}
+    out = ((p.stdout or "") + (p.stderr or "")).strip()
+    if p.returncode != 0:
+        low = out.lower()
+        if "authentication failed" in low or "could not read username" in low or "permission denied" in low:
+            return {"ok": False, "repo": str(r), "error": "GitHub rejected the push (sign in: `gh auth login`, or use an SSH remote).", "detail": out[-500:]}
+        if "no upstream" in low or "has no upstream branch" in low:
+            return {"ok": False, "repo": str(r), "error": f"Branch '{branch}' has no upstream — push once with tracking, then Sync.", "detail": out[-500:]}
+        return {"ok": False, "repo": str(r), "error": out[-500:] or "Push failed."}
+    return {"ok": True, "repo": str(r), "remote": remote, "branch": branch, "output": out[:2000]}
+
+
 def api_graph_viz(repo: str | Path | None = None, timeline: str | None = None) -> dict:
     """Structured graph for the right rail — single shared ROW_HEIGHT, orange accent logic."""
     r = _resolve_repo(repo)
@@ -821,7 +1005,8 @@ def api_graph_viz(repo: str | Path | None = None, timeline: str | None = None) -
         current = cur_r.stdout.strip() if cur_r.returncode == 0 else "main"
         br_r = subprocess.run(["git", "branch", "--format=%(refname:short)"], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace")
         branches = [l.strip() for l in br_r.stdout.splitlines() if l.strip()] if br_r.returncode == 0 else [current]
-        # All commits — if timeline filter given, only that file's history
+        # All commits — if timeline filter given, strictly that file's history
+        # (same scope as api_log, so graph and list agree)
         if timeline:
             tf = _get_timeline_file(r, timeline)
             tfile = str(tf.relative_to(r)) if tf.is_relative_to(r) else str(tf)
@@ -936,6 +1121,9 @@ def api_graph_viz(repo: str | Path | None = None, timeline: str | None = None) -
 
 def api_delete(repo: str | Path | None = None, rev: str = "", timeline: str | None = None) -> dict:
     r = _resolve_repo(repo)
+    denied = _require_allowed_repo(r)
+    if denied:
+        return denied
     if not rev or not str(rev).strip():
         return {"ok": False, "error": "No version given"}
     rev = str(rev).strip()
@@ -948,7 +1136,7 @@ def api_delete(repo: str | Path | None = None, rev: str = "", timeline: str | No
         rv = rv.strip()
         if rv.isdigit():
             n = int(rv)
-            vers = git_store.log_versions(r, limit=max(30, n), timeline_file=tfile) if tfile else git_store.log_versions(r, limit=max(30, n))
+            vers = _alias_versions(r, tfile, max(30, n))
             if 0 <= n - 1 < len(vers):
                 return vers[n - 1]["hash"]
         return rv
@@ -1106,13 +1294,16 @@ def _try_resolve_export(out_path: Path) -> tuple[bool, str]:
                     return True, f"Exported '{tname}' → {out_path} via project.ExportTimeline"
             except Exception:
                 pass
-        return False, "Auto-export not available in this Resolve version — use File → Export Timeline → OpenTimelineIO → timeline.otio"
+        return False, f"Auto-export not available in this Resolve version — use File → Export Timeline → OpenTimelineIO → {out_path} (must land exactly there)"
     except Exception as e:
         return False, f"Export error: {e}"
 
 
 def api_export(repo: str | Path | None = None, out: str | Path | None = None, timeline: str | None = None) -> dict:
     r = _resolve_repo(repo)
+    denied = _require_allowed_repo(r)
+    if denied:
+        return denied
     r.mkdir(parents=True, exist_ok=True)
     if out:
         out_path = Path(out).expanduser().resolve()
@@ -1133,7 +1324,7 @@ def api_export(repo: str | Path | None = None, out: str | Path | None = None, ti
 
 
 def _try_resolve_import(otio_path: Path) -> tuple[bool, str]:
-    """Try to auto-import OTIO into current Resolve project and auto-save/close/reopen.
+    """Try to auto-import OTIO into current Resolve project and auto-save.
 
     Uses MediaPool.ImportTimelineFromFile (correct OTIO API), then SaveProject,
     then Close + Load to ensure restored timeline is current. Best-effort.
@@ -1206,7 +1397,12 @@ def _try_resolve_import(otio_path: Path) -> tuple[bool, str]:
                     except Exception:
                         continue
                 if imported:
-                    # Save project so restored timeline persists after close/reopen
+                    # Save project so restored timeline persists.
+                    # NOTE: never CloseProject/LoadProject here — background or
+                    # restore flows must not visibly switch the user's open
+                    # Resolve project. SetCurrentTimeline above already makes
+                    # the restored timeline current; the user reopens manually
+                    # if Resolve ever shows a stale state.
                     try:
                         pm.SaveProject()
                     except Exception:
@@ -1214,26 +1410,7 @@ def _try_resolve_import(otio_path: Path) -> tuple[bool, str]:
                             project.SaveProject()  # some versions
                         except Exception:
                             pass
-                    # Try close and reopen to ensure correct version is loaded
-                    try:
-                        # Save again explicitly
-                        if hasattr(pm, "SaveProject"):
-                            pm.SaveProject()
-                        # Close without saving (already saved)
-                        if hasattr(pm, "CloseProject"):
-                            pm.CloseProject(project)
-                            # Small delay for Resolve to close
-                            import time as _t
-                            _t.sleep(0.8)
-                            # Reopen
-                            reloaded = pm.LoadProject(proj_name)
-                            if reloaded:
-                                return True, f"Imported '{timeline_name}' via ImportTimelineFromFile, saved, closed and reopened '{proj_name}' ✓"
-                            else:
-                                return True, f"Imported '{timeline_name}' and saved '{proj_name}' (reopen manually if needed) ✓"
-                    except Exception as e:
-                        # Even if close/reopen fails, import + save succeeded
-                        return True, f"Imported '{timeline_name}' via ImportTimelineFromFile and saved ✓ (close/reopen: {e})"
+                    return True, f"Imported '{timeline_name}' via ImportTimelineFromFile and saved '{proj_name}' ✓ (already set as the current timeline)"
         except Exception:
             pass
         # 2) Fallback: MediaPool.ImportMedia (older, may work for some)

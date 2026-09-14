@@ -66,7 +66,7 @@ pyinstaller --onefile --name "$BIN_NAME-$TARGET" --distpath "$OUT_DIR" --workpat
   --paths "$REPO_DIR/src" \
   --collect-all opentimelineio --collect-data opentimelineio \
   --hidden-import=opentimelineio --hidden-import=opentimelineio.adapters.builtin_adapters \
-  --hidden-import=PIL --hidden-import=rich --copy-metadata opentimelineio \
+  --hidden-import=PIL --hidden-import=rich --copy-metadata opentimelineio --copy-metadata get-syncd \
   "$REPO_DIR/scripts/sidecar_entry.py" 2>&1 | tail -n 20
 rm -rf "$WORKDIR"
 

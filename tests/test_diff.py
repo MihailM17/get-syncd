@@ -49,6 +49,19 @@ def test_trim_early_no_false_positives():
     assert d.summary["runtime_delta_s"] == -1.0
 
 
+def test_first_save_empty_vs_full():
+    from get_syncd.otio_parse import NormalizedTimeline
+    old = NormalizedTimeline(name="Empty", tracks=[])
+    new = parse(base)
+    d = diff_timelines(old, new)
+    assert d.summary["added"] == len(base), d.summary
+    assert d.summary["removed"] == 0
+    assert all(c.type == "added" for c in d.changes)
+    assert d.summary["old_duration_s"] == 0.0
+    assert d.summary["new_duration_s"] > 0
+    assert d.summary["runtime_delta_s"] == d.summary["new_duration_s"]
+
+
 def test_added():
     old = parse(base)
     added = [dict(c) for c in base]

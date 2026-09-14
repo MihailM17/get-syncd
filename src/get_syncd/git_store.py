@@ -328,12 +328,24 @@ def status(repo_path: Path | str = ".", timeline_file: str = "timeline.otio") ->
             if head_check.returncode != 0:
                 has_changes = True  # No commits yet, so changes exist
             else:
-                # Check staged vs HEAD as well
-                staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(repo), capture_output=True)
+                # Check staged vs HEAD as well — scoped to this file so a
+                # staged save for ANOTHER timeline doesn't mark this one dirty
+                staged = subprocess.run(["git", "diff", "--cached", "--quiet", "--", timeline_file], cwd=str(repo), capture_output=True)
                 if staged.returncode != 0:
                     has_changes = True
     except Exception as e:
         return {"is_repo": True, "has_changes": None, "message": f"Error checking status: {e}"}
+
+    if not has_changes:
+        # Brand-new (never saved) files are untracked: `git diff` does not see
+        # them at all, so check porcelain explicitly — otherwise the first save
+        # of a timeline reports "up to date" and Save stays blocked.
+        try:
+            por = _run_git(["status", "--porcelain", "--", timeline_file], cwd=repo, check=False)
+            if por.stdout.strip().startswith("??"):
+                return {"is_repo": True, "has_changes": True, "message": "New file — save your first version.", "stat": ""}
+        except Exception:
+            pass
 
     if has_changes:
         # Also report diff stat
@@ -381,17 +393,59 @@ def restore_version(
     return out
 
 
-def log_versions(repo_path: Path | str = ".", limit: int = 20, timeline_file: str = "timeline.otio") -> list[dict]:
-    """Return list of commits that touched timeline file."""
+def commit_otio_files(repo_path: Path | str, rev: str) -> list[str]:
+    """Return .otio files (repo-relative) touched by a commit. Best-effort, never raises."""
+    repo = Path(repo_path)
+    try:
+        r = _run_git(["show", "--name-only", "--pretty=format:", str(rev)], cwd=repo, check=False)
+        if r.returncode != 0 or not r.stdout.strip():
+            return []
+        out = []
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.lower().endswith(".otio") and line not in out:
+                out.append(line)
+        return out
+    except Exception:
+        return []
+
+
+def log_versions(
+    repo_path: Path | str = ".",
+    limit: int = 20,
+    timeline_file: str | list[str] | None = "timeline.otio",
+    fallback: bool = True,
+) -> list[dict]:
+    """Return list of commits that touched timeline file(s).
+
+    timeline_file may be a single path, a list of paths (union, newest-first),
+    or None for all commits in the repo (no pathspec). When a single file has
+    no history, the all-commits fallback applies unless fallback=False — pass
+    fallback=False for per-timeline views so an untouched timeline shows
+    nothing instead of other timelines' versions.
+    """
     repo = Path(repo_path)
     if not is_git_repo(repo):
         return []
     try:
         # Pretty format: hash|author|date|message
-        r = _run_git(["log", f"-n{limit}", "--pretty=format:%H|%an|%ad|%s", "--date=short", "--", timeline_file], cwd=repo, check=False)
+        if timeline_file is None:
+            paths: list[str] = []
+        elif isinstance(timeline_file, (list, tuple)):
+            paths = [str(p) for p in timeline_file if str(p).strip()]
+        else:
+            paths = [str(timeline_file)]
+        if paths:
+            r = _run_git(["log", f"-n{limit}", "--pretty=format:%H|%an|%ad|%s", "--date=short", "--"] + paths, cwd=repo, check=False)
+        else:
+            # All view: every branch, so versions on experiment branches show too
+            r = _run_git(["log", "--all", f"-n{limit}", "--pretty=format:%H|%an|%ad|%s", "--date=short"], cwd=repo, check=False)
         if r.returncode != 0 or not r.stdout.strip():
-            # Fallback to all commits
-            r = _run_git(["log", f"-n{limit}", "--pretty=format:%H|%an|%ad|%s", "--date=short"], cwd=repo, check=False)
+            if fallback and len(paths) == 1:
+                # Fallback to all commits (legacy behavior for single-file repos)
+                r = _run_git(["log", f"-n{limit}", "--pretty=format:%H|%an|%ad|%s", "--date=short"], cwd=repo, check=False)
+            else:
+                return []
         lines = [l for l in r.stdout.strip().split("\n") if l.strip()]
         out = []
         for line in lines:
@@ -517,9 +571,12 @@ def delete_version(repo_path: Path | str, rev: str, timeline_file: str = "timeli
                         cur_branch = "main"
                     # Create temp orphan
                     _run_git(["checkout", "--orphan", "temp-replay-root"], cwd=repo, check=False)
+                    # Clean untracked leftovers FIRST, while .gitignore is still
+                    # in place — and always spare the app cache plus any .otio
+                    # (a dropped commit's leftovers are harmless; deleting the
+                    # user's unsaved exports, previews or media is not).
+                    _run_git(["clean", "-fd", "-e", ".get-syncd", "-e", "*.otio"], cwd=repo, check=False)
                     _run_git(["rm", "-rf", "."], cwd=repo, check=False)
-                    # Remove all files from index
-                    _run_git(["clean", "-fd"], cwd=repo, check=False)
                     for c in later:
                         # Get commit message and author
                         msg_r = _run_git(["log", "-1", "--pretty=%B", c], cwd=repo, check=False)

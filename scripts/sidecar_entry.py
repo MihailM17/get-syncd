@@ -9,17 +9,32 @@ import sys
 from pathlib import Path
 
 # Bump on every sidecar change under test — printed by --test-otio so a stale
-# binary can never silently pass verification again.
-BUILD_ID = "2026-09-04-07-lock-warmup-cleanbuild"
+# binary can never silently pass verification again. Also stamped into
+# /health as "build" so the singleton election reaps same-version binaries
+# from an older build.
+BUILD_ID = "2026-09-14-0.3.0-release"
+
+# Unbuffered stdout: when spawned by the GUI app our prints would otherwise
+# sit in a block buffer forever; the api.log file log is the real record.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import get_syncd.api_server as _api_server_mod
 from get_syncd.api_server import run_api_server
+
+_api_server_mod.SERVER_BUILD = BUILD_ID
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="get-syncd-api")
     ap.add_argument("--port", type=int, default=5174)
+    ap.add_argument("--singleton", dest="singleton", action="store_true", default=True)
+    ap.add_argument("--no-singleton", dest="singleton", action="store_false")
+    ap.add_argument("--no-watchdog", dest="watch_parent", action="store_false", default=True)
     ap.add_argument("--test-otio", type=str, help="Test OTIO parsing on given file and exit")
     ap.add_argument("--build-id", action="store_true", help="Print BUILD_ID and exit")
     args = ap.parse_args()
@@ -46,7 +61,7 @@ def main() -> None:
             traceback.print_exc()
             print(f"Parse failed: {e}")
         return
-    run_api_server(port=args.port)
+    run_api_server(port=args.port, singleton=args.singleton, watch_parent=args.watch_parent)
 
 
 if __name__ == "__main__":

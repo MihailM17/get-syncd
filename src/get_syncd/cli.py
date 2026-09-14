@@ -13,6 +13,7 @@ from .otio_parse import parse_otio_file
 from .diff import diff_timelines, format_text, changelog_line
 from . import git_store
 from . import ui
+from .timeline_files import _sanitize_timeline_name, resolve_timeline_selection
 
 
 # ---------- helpers ----------
@@ -26,14 +27,21 @@ def _get_repo(args) -> Path:
     return Path(path).resolve()
 
 
-def _resolve_rev_alias(repo: Path, rev: str) -> str:
-    """Allow numeric shortcuts: 1 = latest, 2 = previous, etc. Also pass through HEAD/file revs."""
+def _resolve_rev_alias(repo: Path, rev: str, timeline_file: str | None = None) -> str:
+    """Allow numeric shortcuts: 1 = latest, 2 = previous, etc. Also pass through HEAD/file revs.
+
+    With timeline_file, aliases resolve strictly inside that timeline's history
+    (no all-commits fallback), so "1" can never point at another timeline.
+    """
     if rev is None:
         return rev
     # numeric ?
     if rev.strip().isdigit():
         n = int(rev.strip())
-        versions = git_store.log_versions(repo, limit=max(20, n))
+        if timeline_file:
+            versions = git_store.log_versions(repo, limit=max(20, n), timeline_file=timeline_file, fallback=False)
+        else:
+            versions = git_store.log_versions(repo, limit=max(20, n))
         if not versions:
             return rev
         # 1 = newest (index 0)
@@ -46,8 +54,8 @@ def _resolve_rev_alias(repo: Path, rev: str) -> str:
 
 
 def _resolve_rev_to_file(repo: Path, rev: str, timeline_file: str = "timeline.otio") -> Path:
-    # numeric alias first
-    rev = _resolve_rev_alias(repo, rev)
+    # numeric alias first (scoped to the timeline's history when filtered)
+    rev = _resolve_rev_alias(repo, rev, None if timeline_file == "timeline.otio" else timeline_file)
     p = Path(rev)
     if p.exists() and p.is_file():
         return p
@@ -55,7 +63,14 @@ def _resolve_rev_to_file(repo: Path, rev: str, timeline_file: str = "timeline.ot
         return p
     try:
         tmp = tempfile.NamedTemporaryFile(suffix=".otio", delete=False, mode="w")
-        git_store.restore_version(repo, rev, tmp.name, timeline_file=timeline_file)
+        try:
+            git_store.restore_version(repo, rev, tmp.name, timeline_file=timeline_file)
+        except Exception:
+            # Legacy single-file versions predate timelines/*.otio — fall back.
+            if timeline_file != "timeline.otio":
+                git_store.restore_version(repo, rev, tmp.name, timeline_file="timeline.otio")
+            else:
+                raise
         return Path(tmp.name)
     except subprocess.CalledProcessError as e:
         candidate = repo / rev
@@ -81,32 +96,58 @@ def cmd_init(args):
         sys.exit(1)
 
 
-def cmd_save(args):
-    repo = _get_repo(args)
-    source = args.file
-    # nice discovery if no --file — uses safe helper that excludes .get-syncd
-    if source is None:
-        cand = git_store.find_timeline_candidate(repo)
-        if cand and cand.exists():
-            source = str(cand)
-            try:
-                rel = cand.relative_to(repo)
-                if str(rel) != "timeline.otio":
-                    ui.print_hint(f"Using {rel} (canonical is timeline.otio — will copy to timeline.otio on save).")
-                elif cand.name != "timeline.otio":
-                    ui.print_hint(f"Using {cand.name} (no --file given).")
-            except Exception:
-                ui.print_hint(f"Using {cand.name} (no --file given).")
-        else:
+def _require_timeline_for_migrated(repo: Path, tname: str | None, dest: str, source: str | None) -> None:
+    """In migrated repos a save without --timeline/--file is ambiguous — refuse
+    to guess instead of writing legacy storage."""
+    if tname is None and dest == "timeline.otio" and source is None:
+        td = repo / "timelines"
+        if td.exists() and (list(td.glob("*.otio")) + list(td.glob("*.OTIO"))):
             ui.print_error(
-                "No timeline file found.",
-                hint="In Resolve: File → Export Timeline → OpenTimelineIO → save as timeline.otio in this folder, then run get-syncd save",
+                "Can't tell which timeline to save.",
+                hint="Pass --timeline NAME (e.g. get-syncd save --timeline 5), or point --file at timelines/<name>.otio.",
             )
             sys.exit(1)
 
+
+def cmd_save(args):
+    repo = _get_repo(args)
+    source = args.file
+    tname = getattr(args, "timeline", None)
+    # --file under timelines/ implies its timeline
+    if source:
+        try:
+            tdir = (repo / "timelines").resolve()
+            if Path(source).resolve().is_relative_to(tdir):
+                tname = tname or Path(source).stem
+        except Exception:
+            pass
+    sel_name, dest = resolve_timeline_selection(repo, tname)
+    tname = sel_name or tname
+    _require_timeline_for_migrated(repo, tname, dest, source)
+    # nice discovery if no --file — uses safe helper that excludes .get-syncd
+    if source is None:
+        if dest != "timeline.otio" and (repo / dest).exists():
+            source = str(repo / dest)
+        else:
+            cand = git_store.find_timeline_candidate(repo)
+            if cand and cand.exists():
+                source = str(cand)
+                try:
+                    rel = cand.relative_to(repo)
+                    if str(rel) != dest:
+                        ui.print_hint(f"Using {rel} (saving as {dest}).")
+                except Exception:
+                    ui.print_hint(f"Using {cand.name} (no --file given).")
+            else:
+                ui.print_error(
+                    "No timeline file found.",
+                    hint=f"In Resolve: File → Export Timeline → OpenTimelineIO → save as {dest} in this folder, then run get-syncd save",
+                )
+                sys.exit(1)
+
     source_path = Path(source)
     if not source_path.exists():
-        ui.print_error(f"File not found: {source}", hint="Check the path and try again. Example: get-syncd save --file timeline.otio")
+        ui.print_error(f"File not found: {source}", hint=f"Check the path and try again. Example: get-syncd save --file {dest}")
         sys.exit(1)
 
     # Auto message via diff if not provided — then interactive prompt
@@ -114,12 +155,13 @@ def cmd_save(args):
     is_first = False
     auto_msg = None
 
-    # Detect first save
+    # Detect first save for THIS timeline's file (no all-commits fallback)
     try:
-        is_first = not git_store.is_git_repo(repo) or not (repo / "timeline.otio").exists() or git_store.log_versions(repo, limit=1) == []
-        # check HEAD exists
         head_check = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=str(repo), capture_output=True)
-        is_first = head_check.returncode != 0
+        if head_check.returncode != 0:
+            is_first = True
+        else:
+            is_first = git_store.log_versions(repo, limit=1, timeline_file=dest, fallback=False) == []
     except Exception:
         is_first = False
 
@@ -129,18 +171,26 @@ def cmd_save(args):
                 with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tmp:
                     tmp_path = tmp.name
                 try:
-                    git_store.restore_version(repo, "HEAD", tmp_path)
+                    try:
+                        git_store.restore_version(repo, "HEAD", tmp_path, timeline_file=dest)
+                    except Exception:
+                        if dest != "timeline.otio":
+                            git_store.restore_version(repo, "HEAD", tmp_path, timeline_file="timeline.otio")
+                        else:
+                            raise
                     old = parse_otio_file(tmp_path)
                     new = parse_otio_file(source_path)
                     d = diff_timelines(old, new)
                     auto_msg = changelog_line(d)
+                    if tname and tname != "timeline":
+                        auto_msg = f"{tname}: {auto_msg}"
                 except Exception:
                     auto_msg = "Save version"
                 finally:
                     try: Path(tmp_path).unlink()
                     except Exception: pass
             else:
-                auto_msg = "Initial version"
+                auto_msg = f"Initial {tname}" if tname and tname != "timeline" else "Initial version"
         except Exception:
             auto_msg = "Save version"
         # interactive prompt (shows auto suggestion, Enter to accept) — json mode skips prompt
@@ -151,55 +201,14 @@ def cmd_save(args):
         if not message or not message.strip():
             message = auto_msg or "Save version"
 
-    # Commit path: same-file handling
-    dest = "timeline.otio"
-    if Path(source).resolve() == (repo / dest).resolve():
-        if not git_store.is_git_repo(repo):
-            git_store.init_repo(repo)
-        subprocess.run(["git", "add", dest, ".gitignore"], cwd=str(repo), capture_output=True)
-        st = subprocess.run(["git", "status", "--porcelain", "--", dest], cwd=str(repo), capture_output=True, text=True)
-        diff_cached = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(repo), capture_output=True)
-        if not st.stdout.strip() and diff_cached.returncode == 0:
-            head_check = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=str(repo), capture_output=True)
-            if head_check.returncode == 0:
-                diff_head = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", dest], cwd=str(repo), capture_output=True)
-                if diff_head.returncode == 0:
-                    if getattr(args, "json", False):
-                        print(json.dumps({"ok": False, "error": "No changes to save"}, indent=2))
-                        sys.exit(0)
-                    ui.print_save_no_changes()
-                    sys.exit(0)
-        try:
-            subprocess.run(["git", "commit", "-m", message], cwd=str(repo), check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            ui.print_error("Save failed", hint=e.stderr.decode() if e.stderr else str(e))
-            sys.exit(1)
-        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True, text=True, check=True)
-        commit_hash = r.stdout.strip()
-        # snapshot
-        history_dir = repo / ".get-syncd" / "snapshots"
-        history_dir.mkdir(parents=True, exist_ok=True)
-        import shutil
-        try:
-            shutil.copy2(str(repo / dest), str(history_dir / f"{commit_hash[:8]}.otio"))
-        except Exception:
-            pass
-        # preview for GUI
-        try:
-            from .preview import generate_preview
-            generate_preview(repo, commit_hash, repo / dest)
-        except Exception:
-            pass
-        if getattr(args, "json", False):
-            print(json.dumps({"ok": True, "hash": commit_hash, "short": commit_hash[:8], "message": message, "repo": str(repo)}, indent=2))
-        else:
-            ui.print_save_success(commit_hash[:8], message, repo, is_first=is_first)
-        return
-
+    # Commit via the shared store: handles same-file copies, git identity,
+    # per-file change detection, snapshots and previews.
+    if not git_store.is_git_repo(repo):
+        git_store.init_repo(repo)
     try:
         commit_hash = git_store.save_version(repo, source_path, message, timeline_dest=dest)
         if getattr(args, "json", False):
-            print(json.dumps({"ok": True, "hash": commit_hash, "short": commit_hash[:8], "message": message, "repo": str(repo)}, indent=2))
+            print(json.dumps({"ok": True, "hash": commit_hash, "short": commit_hash[:8], "message": message, "repo": str(repo), "timeline": tname, "file": dest}, indent=2))
         else:
             ui.print_save_success(commit_hash[:8], message, repo, is_first=is_first)
     except ValueError as e:
@@ -217,9 +226,20 @@ def cmd_save(args):
         sys.exit(1)
 
 
+def _timeline_opt(args) -> tuple[str | None, str | None]:
+    """--timeline selection for commands: (name or None, repo-relative file or None)."""
+    tname = getattr(args, "timeline", None)
+    if not tname:
+        return None, None
+    repo = _get_repo(args)
+    name, rel = resolve_timeline_selection(repo, tname)
+    return name or tname, rel
+
+
 def cmd_status(args):
     repo = _get_repo(args)
-    result = git_store.status(repo)
+    tname, rel = _timeline_opt(args)
+    result = git_store.status(repo, timeline_file=rel) if rel else git_store.status(repo)
     if getattr(args, "json", False):
         print(json.dumps(result, indent=2))
         return
@@ -228,7 +248,11 @@ def cmd_status(args):
 
 def cmd_log(args):
     repo = _get_repo(args)
-    versions = git_store.log_versions(repo, limit=args.limit)
+    tname, rel = _timeline_opt(args)
+    if rel:
+        versions = git_store.log_versions(repo, limit=args.limit, timeline_file=rel, fallback=False)
+    else:
+        versions = git_store.log_versions(repo, limit=args.limit)
     if getattr(args, "json", False):
         print(json.dumps(versions, indent=2))
         return
@@ -243,82 +267,108 @@ def cmd_diff(args):
     # Support numeric aliases and file paths
     a_raw = args.a
     b_raw = args.b
+    _, rel = _timeline_opt(args)
+    tfile = rel or "timeline.otio"
     # Resolve numeric -> hash before mapping to file
-    a_path = _resolve_rev_to_file(repo, a_raw)
-    b_path = _resolve_rev_to_file(repo, b_raw)
+    a_path = _resolve_rev_to_file(repo, a_raw, timeline_file=tfile)
+    b_path = _resolve_rev_to_file(repo, b_raw, timeline_file=tfile)
 
     try:
-        old = parse_otio_file(a_path)
-        new = parse_otio_file(b_path)
-    except Exception as e:
-        ui.print_error(f"Can't read timelines: {e}")
-        sys.exit(1)
+        try:
+            old = parse_otio_file(a_path)
+            new = parse_otio_file(b_path)
+        except Exception as e:
+            ui.print_error(f"Can't read timelines: {e}")
+            sys.exit(1)
 
-    d = diff_timelines(old, new, track_name=args.track, compare_all_video_tracks=args.all_tracks)
+        d = diff_timelines(old, new, track_name=args.track, compare_all_video_tracks=args.all_tracks)
 
-    if args.json:
-        print(d.to_json())
-        return
+        if args.json:
+            print(d.to_json())
+            return
 
-    # Friendly TUI
-    old_label = a_raw if a_raw else "old"
-    new_label = b_raw if b_raw else "new"
-    # If they used numbers, show short hash labels too
-    versions = git_store.log_versions(repo, limit=20)
-    def label_for(r):
-        if r and r.isdigit() and versions and 1 <= int(r) <= len(versions):
-            return f"#{r} ({versions[int(r)-1]['short']})"
-        return r
-    ui.print_diff_summary(d.summary, label_for(old_label), label_for(new_label), warnings=d.warnings)
-    ui.print_diff_changes([c.to_dict() for c in d.changes], summary=d.summary)
-    if ui.HAS_RICH:
-        # also show text fallback collapsible
-        pass
-    else:
-        print(format_text(d, old_name=old_label, new_name=new_label))
-        print(f"\nChangelog: {changelog_line(d)}")
+        # Friendly TUI
+        old_label = a_raw if a_raw else "old"
+        new_label = b_raw if b_raw else "new"
+        # If they used numbers, show short hash labels too
+        versions = git_store.log_versions(repo, limit=20)
+        def label_for(r):
+            if r and r.isdigit() and versions and 1 <= int(r) <= len(versions):
+                return f"#{r} ({versions[int(r)-1]['short']})"
+            return r
+        ui.print_diff_summary(d.summary, label_for(old_label), label_for(new_label), warnings=d.warnings)
+        ui.print_diff_changes([c.to_dict() for c in d.changes], summary=d.summary)
+        if ui.HAS_RICH:
+            # also show text fallback collapsible
+            pass
+        else:
+            print(format_text(d, old_name=old_label, new_name=new_label))
+            print(f"\nChangelog: {changelog_line(d)}")
+    finally:
+        # materialized git versions live in /tmp — never leak them, and never
+        # touch real .otio paths the user passed in.
+        for pp in (a_path, b_path):
+            try:
+                if pp.suffix == ".otio" and "/tmp" in str(pp) and pp.exists():
+                    pp.unlink()
+            except Exception:
+                pass
+
+
+def _restore_from_rev(repo: Path, rev: str, out: Path, timeline_file: str = "timeline.otio") -> Path:
+    """Materialize a version, falling back to legacy storage for old saves."""
+    try:
+        return git_store.restore_version(repo, rev, out, timeline_file=timeline_file)
+    except Exception:
+        if timeline_file != "timeline.otio":
+            return git_store.restore_version(repo, rev, out, timeline_file="timeline.otio")
+        raise
 
 
 def cmd_restore(args):
     repo = _get_repo(args)
+    tname, trel = _timeline_opt(args)
+    tfile = trel or "timeline.otio"
     # interactive pick if no rev or rev == "interactive"
     rev_input = getattr(args, "rev", None)
     if not rev_input and getattr(args, "interactive", False):
-        versions = git_store.log_versions(repo, limit=20)
+        versions = git_store.log_versions(repo, limit=20, timeline_file=tfile, fallback=False) if tname else git_store.log_versions(repo, limit=20)
         if not versions:
             ui.print_error("No versions yet.", hint="Save one first: get-syncd save -m \"First cut\"")
             sys.exit(1)
         rev_input = ui.prompt_pick_version(versions)
         if not rev_input:
             sys.exit(0)
-    rev = _resolve_rev_alias(repo, rev_input) if rev_input else None
+    rev = _resolve_rev_alias(repo, rev_input, None if tfile == "timeline.otio" else tfile) if rev_input else None
     if not rev:
         ui.print_error("No version selected.", hint="Run: get-syncd log then get-syncd restore <number> --apply")
         sys.exit(1)
 
-    # --apply means overwrite timeline.otio in-place (one-click "change to this version")
+    # --apply means overwrite the timeline's file in-place (one-click "change to this version")
     apply_mode = getattr(args, "apply", False)
     out = None
     if apply_mode:
         if getattr(args, "out", None):
-            ui.print_error("--apply and --out can't be used together", hint="Use --apply to overwrite timeline.otio, or --out to write elsewhere.")
+            ui.print_error("--apply and --out can't be used together", hint=f"Use --apply to overwrite {tfile}, or --out to write elsewhere.")
             sys.exit(1)
-        out = repo / "timeline.otio"
+        out = repo / tfile
         # confirm unless --yes
         if not getattr(args, "yes", False) and sys.stdin.isatty():
             if not ui.confirm_apply(rev_input, out):
                 print("Cancelled.")
                 sys.exit(0)
-        # backup current timeline.otio if it exists
+        # backup the timeline file if it exists — abort if the backup
+        # fails, otherwise we'd overwrite the only copy with no way back.
         try:
             if out.exists():
                 backup_dir = repo / ".get-syncd" / "backups"
                 backup_dir.mkdir(parents=True, exist_ok=True)
                 import shutil, datetime
-                ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                shutil.copy2(str(out), str(backup_dir / f"timeline-{ts}.otio"))
-        except Exception:
-            pass
+                ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                shutil.copy2(str(out), str(backup_dir / f"{out.stem}-{ts}.otio"))
+        except Exception as e:
+            ui.print_error(f"Backup failed ({e}) — refusing to overwrite {out}.", hint="Check disk space/permissions and retry.")
+            sys.exit(1)
     else:
         _out = getattr(args, "out", None)
         out = Path(_out) if _out else Path(rev_input + ".otio")
@@ -335,21 +385,21 @@ def cmd_restore(args):
             ui.print_hint(f"Copied {rev_input} → {out}")
             return
     try:
-        result_path = git_store.restore_version(repo, rev, out)
+        result_path = _restore_from_rev(repo, rev, out, timeline_file=tfile)
         if apply_mode:
             ui.print_restore_apply_success(rev_input, result_path, repo)
             # show diff vs previous HEAD for context
             try:
                 # optional: hint status
-                res = git_store.status(repo)
+                res = git_store.status(repo, timeline_file=tfile)
                 if res.get("has_changes"):
-                    ui.print_hint("Status is now 'Unsaved changes' — that's the restored version waiting in timeline.otio.\nRe-import in Resolve: File → Import Timeline → OpenTimelineIO → timeline.otio\nOr just run get-syncd save to keep this as a new version.")
+                    ui.print_hint(f"Status is now 'Unsaved changes' — that's the restored version waiting in {tfile}.\nRe-import in Resolve: File → Import Timeline → OpenTimelineIO → {tfile}\nOr just run get-syncd save to keep this as a new version.")
             except Exception:
                 pass
         else:
             if ui.HAS_RICH:
                 ui.console.print(ui.Panel(
-                    f"[bold]{rev_input} → {result_path.resolve()}[/]\n\n[dim]Next step in DaVinci Resolve:[/]\n[bold]File → Import Timeline → OpenTimelineIO[/] → pick:\n[cyan]{result_path.resolve()}[/]\n\n[dim]Resolve will create a NEW timeline — your current edit isn't overwritten until you import.[/]\n[dim]Tip: use [cyan]get-syncd restore {rev_input} --apply[/] to directly overwrite timeline.otio (one-click 'change to this version').[/]",
+                    f"[bold]{rev_input} → {result_path.resolve()}[/]\n\n[dim]Next step in DaVinci Resolve:[/]\n[bold]File → Import Timeline → OpenTimelineIO[/] → pick:\n[cyan]{result_path.resolve()}[/]\n\n[dim]Resolve will create a NEW timeline — your current edit isn't overwritten until you import.[/]\n[dim]Tip: use [cyan]get-syncd restore {rev_input} --apply[/] to directly overwrite {tfile} (one-click 'change to this version').[/]",
                     title="[green]Restored![/]",
                     border_style="green",
                 ))
@@ -357,7 +407,7 @@ def cmd_restore(args):
                 print(f"Restored {rev} → {result_path}")
                 print("Next step: In DaVinci Resolve, File → Import Timeline → OpenTimelineIO → select:")
                 print(f"  {result_path.resolve()}")
-                print(f"Tip: get-syncd restore {rev_input} --apply  to overwrite timeline.otio directly.")
+                print(f"Tip: get-syncd restore {rev_input} --apply  to overwrite {tfile} directly.")
     except Exception as e:
         ui.print_error(f"Restore failed: {e}", hint="Try 'get-syncd log' to see valid version numbers or hashes.")
         sys.exit(1)
@@ -382,12 +432,23 @@ def cmd_watch(args):
     if not git_store.is_git_repo(repo):
         ui.print_error("Not a Get Syncd project", hint="Run get-syncd init in your film folder first.")
         sys.exit(1)
-    interval = getattr(args, "interval", 2.0)
+    try:
+        interval = max(float(getattr(args, "interval", 2.0) or 2.0), 0.5)
+    except (TypeError, ValueError):
+        interval = 2.0
     auto = getattr(args, "auto", False)
+    tname, trel = _timeline_opt(args)
+    if tname:
+        watch_rel = trel or "timeline.otio"
+    else:
+        # No explicit timeline: follow Resolve's current timeline when migrated.
+        sel_name, sel_rel = resolve_timeline_selection(repo, None)
+        watch_rel = sel_rel
+        tname = sel_name
     ui.print_watch_start(repo, interval, auto)
     import time
     from pathlib import Path as _P
-    watch_file = repo / "timeline.otio"
+    watch_file = repo / watch_rel
     # track last hash/mtime
     last_hash = ""
     if watch_file.exists():
@@ -407,15 +468,22 @@ def cmd_watch(args):
             if cur_hash != last_hash:
                 last_hash = cur_hash
                 # file changed — check status
-                result = git_store.status(repo)
+                result = git_store.status(repo, timeline_file=watch_rel)
                 if result.get("has_changes"):
                     # show diff vs HEAD
+                    d = None
                     try:
                         import tempfile
                         with tempfile.NamedTemporaryFile(suffix=".otio", delete=False) as tmp:
                             tmp_path = tmp.name
                         try:
-                            git_store.restore_version(repo, "HEAD", tmp_path)
+                            try:
+                                git_store.restore_version(repo, "HEAD", tmp_path, timeline_file=watch_rel)
+                            except Exception:
+                                if watch_rel != "timeline.otio":
+                                    git_store.restore_version(repo, "HEAD", tmp_path, timeline_file="timeline.otio")
+                                else:
+                                    raise
                             old = parse_otio_file(tmp_path)
                             new = parse_otio_file(watch_file)
                             d = diff_timelines(old, new)
@@ -424,15 +492,15 @@ def cmd_watch(args):
                             try: _P(tmp_path).unlink()
                             except Exception: pass
                     except Exception as e:
-                        ui.print_hint(f"Detected change in timeline.otio ({e})")
+                        ui.print_hint(f"Detected change in {watch_rel} ({e})")
                     if auto:
                         # auto save without prompt
                         import subprocess, shutil
-                        msg = changelog_line(d) if 'd' in locals() else "Auto save"
+                        msg = changelog_line(d) if d is not None else "Auto save"
                         print(f"[watch] Auto-saving: {msg}")
                         # use save_version directly
                         try:
-                            h = git_store.save_version(repo, watch_file, msg)
+                            h = git_store.save_version(repo, watch_file, msg, timeline_dest=watch_rel)
                             ui.print_save_success(h[:8], msg, repo)
                         except Exception as e:
                             ui.print_error(f"Auto-save failed: {e}")
@@ -440,11 +508,11 @@ def cmd_watch(args):
                         # interactive prompt
                         ans = ui.prompt_watch_save()
                         if ans == "save":
-                            msg = changelog_line(d) if 'd' in locals() else "Save version"
+                            msg = changelog_line(d) if d is not None else "Save version"
                             # ask for custom message
                             custom = ui.prompt_save_message(msg)
                             try:
-                                h = git_store.save_version(repo, watch_file, custom)
+                                h = git_store.save_version(repo, watch_file, custom, timeline_dest=watch_rel)
                                 ui.print_save_success(h[:8], custom, repo)
                             except ValueError:
                                 ui.print_save_no_changes()
@@ -477,16 +545,18 @@ def cmd_push(args):
 
 def cmd_delete(args):
     repo = _get_repo(args)
+    tname, trel = _timeline_opt(args)
+    tfile = trel or "timeline.otio"
     rev_input = getattr(args, "rev", None)
     if not rev_input:
-        versions = git_store.log_versions(repo, limit=20)
+        versions = git_store.log_versions(repo, limit=20, timeline_file=tfile, fallback=False) if tname else git_store.log_versions(repo, limit=20)
         if not versions:
             ui.print_error("No versions to delete.", hint="Save one first.")
             sys.exit(1)
         rev_input = ui.prompt_pick_version(versions)
         if not rev_input:
             sys.exit(0)
-    rev = _resolve_rev_alias(repo, rev_input)
+    rev = _resolve_rev_alias(repo, rev_input, None if tfile == "timeline.otio" else tfile)
     # Confirm unless --yes
     if not getattr(args, "yes", False) and sys.stdin.isatty():
         versions = git_store.log_versions(repo, limit=50)
@@ -495,7 +565,7 @@ def cmd_delete(args):
             print("Cancelled.")
             sys.exit(0)
     try:
-        res = git_store.delete_version(repo, rev)
+        res = git_store.delete_version(repo, rev, timeline_file=tfile)
         if ui.HAS_RICH:
             ui.console.print(f"[green]Deleted {res['deleted']}[/] — new HEAD {res.get('new_head') or '(no versions left)'}")
         else:
@@ -512,8 +582,19 @@ def cmd_view(args):
     except ImportError as e:
         ui.print_error(f"Viewer not available: {e}")
         sys.exit(1)
-    a_rev = _resolve_rev_alias(repo, args.a) if args.a else None
-    b_rev = _resolve_rev_alias(repo, args.b) if args.b else None
+    def _as_file(x: str | None) -> str | None:
+        # file paths (cwd- or repo-relative) pass straight through to the viewer
+        if not x:
+            return None
+        p = Path(x)
+        if p.exists() and p.is_file():
+            return str(p)
+        rp = repo / x
+        if rp.exists() and rp.is_file():
+            return str(rp)
+        return None
+    a_rev = _as_file(args.a) or _resolve_rev_alias(repo, args.a)
+    b_rev = _as_file(args.b) or _resolve_rev_alias(repo, args.b)
     if not a_rev or not b_rev:
         versions = git_store.log_versions(repo, limit=2)
         if len(versions) >= 2:
@@ -552,6 +633,10 @@ def build_parser():
     def add_repo_arg(parser):
         parser.add_argument("--repo", dest="repo", help="Folder to use (default: current folder)", default=argparse.SUPPRESS)
 
+    def add_timeline_arg(parser):
+        parser.add_argument("--timeline", "-t", dest="timeline", default=None,
+                            help="Which Resolve timeline (e.g. -t 5 saves timelines/5.otio; default: current timeline, else timeline.otio)")
+
     # init
     sp = sub.add_parser("init", help="Set up a new project (one time per film)", description="Create a new Get Syncd project in this folder.")
     sp.add_argument("path", nargs="?", help="Folder to set up (default: this folder)")
@@ -561,7 +646,8 @@ def build_parser():
 
     # save — friendlier help
     sp = sub.add_parser("save", help="Save a new version", description="Save what you just exported from Resolve. Auto-describes what changed if you don't write a note.")
-    sp.add_argument("--file", "-f", help="Which .otio file to save (default: timeline.otio in this folder)")
+    sp.add_argument("--file", "-f", help="Which .otio file to save (default: current timeline's file)")
+    sp.add_argument("--timeline", "-t", dest="timeline", default=None, help="Which Resolve timeline (e.g. -t 5 saves timelines/5.otio)")
     sp.add_argument("-m", "--message", help="Short note like \"Trimmed intro\" (auto-made if you skip it)")
     sp.add_argument("--no-prompt", action="store_true", help="Don't ask to edit the auto note (for scripts)")
     sp.add_argument("--json", action="store_true", help="Machine-readable JSON output (for Tauri)")
@@ -571,6 +657,7 @@ def build_parser():
     # status
     sp = sub.add_parser("status", help="Check if you have unsaved edits")
     sp.add_argument("--json", action="store_true", help="Machine-readable JSON output (for Tauri)")
+    add_timeline_arg(sp)
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_status)
 
@@ -579,6 +666,7 @@ def build_parser():
     sp.add_argument("-n", "--limit", type=int, default=20, help="How many to show")
     sp.add_argument("-v", "--verbose", action="store_true", help="Show full hashes")
     sp.add_argument("--json", action="store_true", help="Machine-readable JSON output (for Tauri)")
+    add_timeline_arg(sp)
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_log)
 
@@ -589,32 +677,36 @@ def build_parser():
     sp.add_argument("--json", action="store_true", help="Machine-readable output")
     sp.add_argument("--track", help="Only compare this track name")
     sp.add_argument("--all-tracks", action="store_true", help="Compare all video tracks")
+    add_timeline_arg(sp)
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_diff)
 
     # restore
-    sp = sub.add_parser("restore", help="Bring back an old version", description="Makes a .otio file you re-import in Resolve. Use --apply to directly overwrite timeline.otio (one-click 'change to this version').")
+    sp = sub.add_parser("restore", help="Bring back an old version", description="Makes a .otio file you re-import in Resolve. Use --apply to directly overwrite the timeline's file (one-click 'change to this version').")
     sp.add_argument("rev", nargs="?", help="Version to bring back: number (1=latest), hash, or HEAD~1 (omit for interactive picker)")
     sp.add_argument("--out", "-o", help="Where to write it (default: version-N.otio, ignored with --apply)")
-    sp.add_argument("--apply", action="store_true", help="Overwrite timeline.otio directly so Resolve sees it next import/open (one-click change)")
+    sp.add_argument("--apply", action="store_true", help="Overwrite the timeline's file directly so Resolve sees it next import/open (one-click change)")
     sp.add_argument("--yes", action="store_true", help="Skip confirmation when using --apply")
     sp.add_argument("--interactive", action="store_true", help="Pick version from a list")
+    add_timeline_arg(sp)
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_restore)
 
     # checkout / switch alias — one-click change
     for name in ("checkout", "switch", "use"):
-        sp = sub.add_parser(name, help="Switch timeline to an old version (one-click, overwrites timeline.otio)")
+        sp = sub.add_parser(name, help="Switch timeline to an old version (one-click, overwrites the timeline's file)")
         sp.add_argument("rev", nargs="?", help="Version to switch to: number, hash, or HEAD~1")
         sp.add_argument("--yes", action="store_true", help="Skip confirmation")
         sp.add_argument("--interactive", action="store_true", help="Pick version from a list")
+        add_timeline_arg(sp)
         add_repo_arg(sp)
         sp.set_defaults(func=cmd_checkout)
 
     # watch — automatic folder watcher
-    sp = sub.add_parser("watch", help="Watch for Resolve exports and auto-prompt to save", description="Watches timeline.otio in this folder. When Resolve re-exports, shows what changed and prompts to save. Use --auto to save without asking.")
-    sp.add_argument("--interval", type=float, default=2.0, help="Poll every N seconds (default 2.0)")
+    sp = sub.add_parser("watch", help="Watch for Resolve exports and auto-prompt to save", description="Watches the timeline's .otio file in this folder. When Resolve re-exports, shows what changed and prompts to save. Use --auto to save without asking.")
+    sp.add_argument("--interval", type=float, default=2.0, help="Poll every N seconds (default 2.0, minimum 0.5)")
     sp.add_argument("--auto", action="store_true", help="Auto-save without prompting")
+    add_timeline_arg(sp)
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_watch)
 
@@ -638,12 +730,14 @@ def build_parser():
     sp = sub.add_parser("delete", help="Delete a version from history", description="Permanently removes a version (git rebase/reset). Later versions are rewritten. Use with care.")
     sp.add_argument("rev", nargs="?", help="Version to delete: number (1=latest), hash, or HEAD~1 (omit for interactive picker)")
     sp.add_argument("--yes", action="store_true", help="Skip confirmation")
+    add_timeline_arg(sp)
     add_repo_arg(sp)
     sp.set_defaults(func=cmd_delete)
     for _alias in ("rm", "remove", "trash"):
         sp = sub.add_parser(_alias, help="Delete a version (alias for delete)")
         sp.add_argument("rev", nargs="?", help="Version to delete")
         sp.add_argument("--yes", action="store_true", help="Skip confirmation")
+        add_timeline_arg(sp)
         add_repo_arg(sp)
         sp.set_defaults(func=cmd_delete)
 
@@ -651,7 +745,10 @@ def build_parser():
     sp = sub.add_parser("serve", help="Start local JSON API for desktop app (Tauri sidecar)", description="Starts http://127.0.0.1:5174 with /api/status, /api/log, /api/diff, /api/save, /api/restore — React/Tauri fetches this.")
     sp.add_argument("--port", type=int, default=5174, help="Port (default 5174)")
     sp.add_argument("--open", action="store_true", help="Open health check in browser")
-    sp.set_defaults(func=lambda args: __import__("get_syncd.api_server", fromlist=["run_api_server"]).run_api_server(port=args.port, open_browser=args.open))
+    sp.add_argument("--singleton", dest="singleton", action="store_true", default=True, help="Reuse healthy same-version daemon, reap stale orphans (default on)")
+    sp.add_argument("--no-singleton", dest="singleton", action="store_false", help="Disable singleton election (always bind a new port)")
+    sp.add_argument("--no-watchdog", dest="watch_parent", action="store_false", default=True, help="Don't exit when the parent process dies")
+    sp.set_defaults(func=lambda args: __import__("get_syncd.api_server", fromlist=["run_api_server"]).run_api_server(port=args.port, open_browser=args.open, singleton=args.singleton, watch_parent=args.watch_parent))
 
     # gui — sidecar desktop app
     sp = sub.add_parser("gui", help="Open sidecar desktop app (runs beside Resolve)", description="Sidecar window: Export from Resolve with one click, add note, save, see log/diff, change to any version, branches, watch. Keep open beside DaVinci Resolve.")
