@@ -12,7 +12,7 @@ from pathlib import Path
 # binary can never silently pass verification again. Also stamped into
 # /health as "build" so the singleton election reaps same-version binaries
 # from an older build.
-BUILD_ID = "2026-09-14-0.3.0-release"
+BUILD_ID = "2026-09-14-0.3.1-release"
 
 # Unbuffered stdout: when spawned by the GUI app our prints would otherwise
 # sit in a block buffer forever; the api.log file log is the real record.

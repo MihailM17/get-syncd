@@ -66,6 +66,88 @@ def _frames_to_timecode(frames: float) -> str:
     return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
 
 
+def format_timecode(seconds: float) -> str:
+    """Timeline position as HH:MM:SS.mmm (quantized to the millisecond first
+    so 59.9999s never renders as an invalid 60.000s)."""
+    total_ms = max(0, int(round(float(seconds) * 1000)))
+    h, rem = divmod(total_ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def format_signed_delta(seconds: float) -> str:
+    """Signed position delta for moves: +00:03.200 / -00:03.200."""
+    s = float(seconds)
+    sign = "-" if s < 0 else "+"
+    return f"{sign}{format_timecode(abs(s))}"
+
+
+def _fmt_secs(seconds: float) -> str:
+    """Compact seconds for prose: 2.3, 12, 0.5 (never 2.300)."""
+    s = round(float(seconds), 1)
+    if s == int(s):
+        return str(int(s))
+    return f"{s:.1f}"
+
+
+def _track_offsets(track: NormalizedTrack) -> list[float]:
+    """Timeline start (seconds) of every item = prefix sums of durations."""
+    offsets: list[float] = []
+    acc = 0.0
+    for item in track.items:
+        offsets.append(round(acc, 3))
+        try:
+            acc += _frames_to_seconds(item.duration_frames)
+        except Exception:
+            pass
+    return offsets
+
+
+def _volume_delta(a: NormalizedClip, b: NormalizedClip) -> dict | None:
+    """Volume sub-change between matched clips, or None.
+
+    Compared at 1-decimal precision so a reported change always renders
+    visibly different values (never "-6.0 dB → -6.0 dB").
+    """
+    if a.volume_db is None or b.volume_db is None:
+        return None
+    old = round(float(a.volume_db), 1)
+    new = round(float(b.volume_db), 1)
+    if old == new:
+        return None
+    return {"old": old, "new": new}
+
+
+def _title_delta(a: NormalizedClip, b: NormalizedClip) -> dict | None:
+    """Title-text sub-change between matched clips/stacks, or None."""
+    olds = list(getattr(a, "title_texts", None) or ([a.title_text] if a.title_text else []))
+    news = list(getattr(b, "title_texts", None) or ([b.title_text] if b.title_text else []))
+    olds = [str(t).strip() for t in olds if str(t or "").strip()]
+    news = [str(t).strip() for t in news if str(t or "").strip()]
+    if olds == news:
+        return None
+    return {"old": olds[0] if olds else None, "new": news[0] if news else None}
+
+
+def _attr_deltas(a: NormalizedClip, b: NormalizedClip) -> dict:
+    """Volume/title sub-changes between a matched pair (possibly empty)."""
+    out: dict = {}
+    try:
+        v = _volume_delta(a, b)
+        if v:
+            out["volume"] = v
+    except Exception:
+        pass
+    try:
+        t = _title_delta(a, b)
+        if t:
+            out["title"] = t
+    except Exception:
+        pass
+    return out
+
+
 def _clips_equal_by_trim(a: NormalizedClip, b: NormalizedClip, tolerance_frames: float = 1.0) -> bool:
     """Check if two clips with same identity have same trim (start+duration)."""
     if a.kind != b.kind:
@@ -95,6 +177,13 @@ def _clips_equal_by_trim(a: NormalizedClip, b: NormalizedClip, tolerance_frames:
         if abs(ao2 - bo2) > tolerance_frames:
             return False
         return True
+    if a.kind == "stack":
+        # Same compound only if the duration matches AND no nested title
+        # changed (title texts are flattened at parse, incl. Stacks that
+        # nest whole Tracks).
+        if a.duration_frames != b.duration_frames:
+            return False
+        return list(getattr(a, "title_texts", []) or []) == list(getattr(b, "title_texts", []) or [])
     return a.duration_frames == b.duration_frames
 
 
@@ -126,7 +215,40 @@ def _describe_trim(a: NormalizedClip, b: NormalizedClip) -> dict:
         details["new_in_offset"] = b.in_offset_frames
         details["old_out_offset"] = a.out_offset_frames
         details["new_out_offset"] = b.out_offset_frames
+    else:
+        # Stacks / unknown kinds: bare duration change (no source offsets).
+        details["old_duration_s"] = round(_frames_to_seconds(a.duration_frames), 3)
+        details["new_duration_s"] = round(_frames_to_seconds(b.duration_frames), 3)
+        details["delta_s"] = round(_frames_to_seconds(b.duration_frames - a.duration_frames), 3)
     return details
+
+
+def _trim_line(a: NormalizedClip, b: NormalizedClip, details: dict) -> str:
+    """Human trim wording with direction. Never exposes raw source offsets."""
+    eps = 0.002
+    try:
+        delta_s = float(details.get("delta_s", 0.0))
+    except (TypeError, ValueError):
+        delta_s = 0.0
+    try:
+        head_s = float(details.get("start_delta_frames", 0.0)) / NORMALIZED_RATE
+    except (TypeError, ValueError):
+        head_s = 0.0
+    # Tail change = total change minus what the head shift accounts for:
+    # new_dur = old_dur - head_cut + tail_change.
+    tail_s = delta_s + head_s
+    if abs(delta_s) < eps and abs(head_s) >= eps:
+        # Same duration, later/earlier source: a slip, not a trim.
+        return f"Slipped {_fmt_secs(abs(head_s))}s {'earlier' if head_s < 0 else 'later'}"
+    verb = "Extended" if delta_s > 0 else "Trimmed"
+    parts: list[str] = []
+    if abs(head_s) >= eps:
+        parts.append(f"{_fmt_secs(abs(head_s))}s from beginning")
+    if abs(tail_s) >= eps:
+        parts.append(f"{_fmt_secs(abs(tail_s))}s from end")
+    if not parts:
+        parts.append(f"{_fmt_secs(abs(delta_s))}s")
+    return f"{verb} " + ", ".join(parts)
 
 
 def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: float = 1.0) -> TimelineDiff:
@@ -147,6 +269,7 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
     removed = 0
     trimmed = 0
     reordered = 0
+    modified = 0
     gap_changed = 0
     transition_changed = 0
 
@@ -161,7 +284,25 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
                 oc = old.items[oi]
                 nc = new.items[nj]
                 if not _clips_equal_by_trim(oc, nc, tolerance_frames):
-                    # Determine change type
+                    # A title change deep inside a compound surfaces as a
+                    # modification of the stack (with the stack's position),
+                    # not a trim — durations alone can't describe it.
+                    if oc.kind == "stack":
+                        tdelta = _title_delta(oc, nc)
+                        if tdelta:
+                            result.changes.append(
+                                ClipChange(
+                                    type="modified",
+                                    index_old=oi,
+                                    index_new=nj,
+                                    clip_name=nc.name or oc.name,
+                                    url=nc.url or oc.url,
+                                    kind=oc.kind,
+                                    details={"title": tdelta, "is_title": True},
+                                )
+                            )
+                            modified += 1
+                            continue
                     if oc.kind == "gap":
                         result.changes.append(
                             ClipChange(
@@ -199,7 +340,7 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
                                     clip_name=nc.name,
                                     url=nc.url,
                                     kind=oc.kind,
-                                    details=_describe_trim(oc, nc),
+                                    details={**_describe_trim(oc, nc), **_attr_deltas(oc, nc)},
                                 )
                             )
                         else:
@@ -211,10 +352,27 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
                                     clip_name=nc.name or oc.name,
                                     url=nc.url or oc.url,
                                     kind=oc.kind,
-                                    details=_describe_trim(oc, nc),
+                                    details={**_describe_trim(oc, nc), **_attr_deltas(oc, nc)},
                                 )
                             )
                         trimmed += 1
+                else:
+                    # Structurally identical, but volume and/or title text
+                    # differ — a modification, not a trim.
+                    attrs = _attr_deltas(oc, nc)
+                    if attrs and oc.kind == "clip":
+                        result.changes.append(
+                            ClipChange(
+                                type="modified",
+                                index_old=oi,
+                                index_new=nj,
+                                clip_name=nc.name or oc.name,
+                                url=nc.url or oc.url,
+                                kind=oc.kind,
+                                details=attrs,
+                            )
+                        )
+                        modified += 1
 
         elif tag == "replace":
             # Could be reordered, trimmed+replaced, or added/removed mix
@@ -258,7 +416,7 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
                             clip_name=nc.name or oc.name,
                             url=nc.url,
                             kind=nc.kind,
-                            details={**_describe_trim(oc, nc), "also_reordered": True},
+                            details={**_describe_trim(oc, nc), "also_reordered": True, **_attr_deltas(oc, nc)},
                         )
                     )
                     trimmed += 1
@@ -271,7 +429,7 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
                             clip_name=nc.name or oc.name,
                             url=nc.url,
                             kind=nc.kind,
-                            details={"from_index": oi, "to_index": nj, "loose_identity": ident},
+                            details={"from_index": oi, "to_index": nj, "loose_identity": ident, **_attr_deltas(oc, nc)},
                         )
                     )
                     reordered += 1
@@ -398,7 +556,7 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
                         clip_name=match.clip_name or rc.clip_name,
                         url=match.url or rc.url,
                         kind=match.kind,
-                        details={**_describe_trim(oc, nc), "also_reordered": True},
+                        details={**_describe_trim(oc, nc), "also_reordered": True, **_attr_deltas(oc, nc)},
                     )
                 )
                 trimmed += 1
@@ -413,7 +571,7 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
                         clip_name=match.clip_name or rc.clip_name,
                         url=match.url or rc.url,
                         kind=match.kind,
-                        details={"from_index": rc.index_old, "to_index": match.index_new},
+                        details={"from_index": rc.index_old, "to_index": match.index_new, **(_attr_deltas(oc, nc) if oc and nc else {})},
                     )
                 )
                 reordered += 1
@@ -426,6 +584,8 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
         # Sort by new index then old
         result.changes.sort(key=lambda c: (c.index_new if c.index_new is not None else 9999, c.index_old if c.index_old is not None else 9999))
 
+    _annotate_positions(result.changes, old, new)
+
     # Compute runtime delta
     old_dur = old.duration_frames()
     new_dur = new.duration_frames()
@@ -437,6 +597,7 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
         "removed": removed,
         "trimmed": trimmed,
         "reordered": reordered,
+        "modified": modified,
         "gap_changed": gap_changed,
         "transition_changed": transition_changed,
         "total_changes": len(result.changes),
@@ -447,6 +608,518 @@ def diff_tracks(old: NormalizedTrack, new: NormalizedTrack, tolerance_frames: fl
     }
 
     return result
+
+
+def _annotate_positions(changes: list, old: NormalizedTrack, new: NormalizedTrack) -> None:
+    """Attach timeline positions to every change, in place.
+
+    New-side position for added/moved-to/trimmed-in-place; old-side position
+    for removed. Reordered changes get both plus the signed delta. Sections
+    and timecodes downstream read only these fields.
+    """
+    try:
+        old_off = _track_offsets(old)
+    except Exception:
+        old_off = []
+    try:
+        new_off = _track_offsets(new)
+    except Exception:
+        new_off = []
+    for c in changes:
+        try:
+            d = c.details
+            if not isinstance(d, dict):
+                continue
+            if c.index_new is not None and 0 <= c.index_new < len(new_off):
+                d["timeline_start_s"] = new_off[c.index_new]
+            if c.index_old is not None and 0 <= c.index_old < len(old_off):
+                d["timeline_old_s"] = old_off[c.index_old]
+            if c.type == "reordered" and "timeline_start_s" in d and "timeline_old_s" in d:
+                d["move_delta_s"] = round(d["timeline_start_s"] - d["timeline_old_s"], 3)
+        except Exception:
+            continue
+
+
+def _volume_lines(details: dict) -> list[str]:
+    v = details.get("volume") if isinstance(details, dict) else None
+    if not isinstance(v, dict):
+        return []
+    try:
+        return [f"Volume: {float(v['old']):.1f} dB → {float(v['new']):.1f} dB"]
+    except (KeyError, TypeError, ValueError):
+        return []
+
+
+def _title_lines(details: dict) -> list[str]:
+    t = details.get("title") if isinstance(details, dict) else None
+    if not isinstance(t, dict):
+        return []
+    old = t.get("old")
+    new = t.get("new")
+    if old and new:
+        return [f'Text: "{old}" → "{new}"']
+    if new:
+        return [f'Text: "{new}"']
+    if old:
+        return [f'Text: "{old}"']
+    return []
+
+
+def change_lines(ch, old_item=None, new_item=None) -> list[str]:
+    """Preformatted detail lines for one change (the sections contract).
+
+    The frontend renders these verbatim, so CLI and UI can never drift apart.
+    Volume/title sub-lines appear only when the value actually differs —
+    never as attribute dumps.
+    """
+    d = ch.details if isinstance(getattr(ch, "details", None), dict) else {}
+    lines: list[str] = []
+    t = ch.type
+    title_text = ""
+    try:
+        for cand in (new_item, old_item):
+            if cand is not None and getattr(cand, "title_text", None):
+                title_text = str(cand.title_text).strip()
+                break
+    except Exception:
+        title_text = ""
+    if t == "added":
+        if title_text:
+            lines.append(f'+ Added "{title_text}"')
+        else:
+            lines.append("+ Added")
+    elif t == "removed":
+        if title_text:
+            lines.append(f'- Removed "{title_text}"')
+        else:
+            lines.append("- Removed")
+    elif t == "trimmed":
+        if old_item is not None and new_item is not None:
+            lines.append(_trim_line(old_item, new_item, d))
+        elif "delta_s" in d:
+            try:
+                delta = float(d.get("delta_s", 0.0))
+                verb = "Extended" if delta > 0 else "Trimmed"
+                lines.append(f"{verb} {_fmt_secs(abs(delta))}s")
+            except (TypeError, ValueError):
+                lines.append("Trimmed")
+        elif "old_duration_s" in d and "new_duration_s" in d:
+            try:
+                lines.append(f"Duration {d['old_duration_s']}s → {d['new_duration_s']}s")
+            except Exception:
+                lines.append("Changed")
+        else:
+            lines.append("Changed")
+    elif t == "reordered":
+        if "move_delta_s" in d:
+            try:
+                lines.append(f"Moved {format_signed_delta(float(d['move_delta_s']))}")
+            except (TypeError, ValueError):
+                lines.append("Moved")
+        else:
+            lines.append("Moved")
+    elif t == "renamed":
+        old_n = d.get("renamed_from", "")
+        new_n = d.get("renamed_to", ch.clip_name)
+        lines.append(f'Renamed "{old_n}" → "{new_n}"')
+    elif t == "modified":
+        pass  # lines come entirely from the volume/title sublines below
+    elif t == "gap_changed":
+        try:
+            lines.append(f"Gap length {d.get('old_gap_s')}s → {d.get('new_gap_s')}s")
+        except Exception:
+            lines.append("Gap changed")
+    elif t == "transition_changed":
+        ot, nt = d.get("old_type"), d.get("new_type")
+        if ot or nt:
+            lines.append(f"Transition {ot or '?'} → {nt or '?'}")
+        else:
+            lines.append("Transition changed")
+    else:
+        lines.append("Changed")
+    lines.extend(_volume_lines(d))
+    lines.extend(_title_lines(d))
+    if t == "modified" and not lines:
+        lines.append("Changed")
+    return lines
+
+
+def _track_bucket(kind: str) -> str:
+    k = str(kind or "").lower()
+    if "audio" in k:
+        return "audio"
+    return "video"
+
+
+def diff_all_tracks(old: NormalizedTimeline, new: NormalizedTimeline, tolerance_frames: float = 1.0) -> TimelineDiff:
+    """Diff every video and audio track, matched by name within kind.
+
+    Each change is tagged details["track"]/details["track_kind"] so the
+    sections view can group entries. Added tracks contribute per-item added
+    changes (not just a warning); removed tracks contribute per-item removed.
+    """
+    combined = TimelineDiff()
+    totals = {"added": 0, "removed": 0, "trimmed": 0, "reordered": 0, "modified": 0,
+              "gap_changed": 0, "transition_changed": 0}
+    old_dur_total = 0.0
+    new_dur_total = 0.0
+
+    def _kind_tracks(tl: NormalizedTimeline, bucket: str) -> list:
+        return [t for t in tl.tracks if _track_bucket(t.kind) == bucket]
+
+    for bucket in ("video", "audio"):
+        old_tracks = _kind_tracks(old, bucket)
+        new_tracks = _kind_tracks(new, bucket)
+        new_by_name = {t.name: t for t in new_tracks}
+        for ot in old_tracks:
+            nt = new_by_name.get(ot.name)
+            if nt is None:
+                combined.warnings.append(f"Track removed in new: {ot.name}")
+                offs = _track_offsets(ot)
+                for item in ot.items:
+                    pos = offs[item.index] if 0 <= item.index < len(offs) else None
+                    details: dict = {"duration_s": round(_frames_to_seconds(item.duration_frames), 3),
+                                     "track": ot.name, "track_kind": bucket}
+                    if pos is not None:
+                        details["timeline_old_s"] = pos
+                    combined.changes.append(
+                        ClipChange(type="removed", index_old=item.index, index_new=None,
+                                   clip_name=item.name, url=item.url, kind=item.kind,
+                                   details=details)
+                    )
+                    totals["removed"] += 1
+                continue
+            d = diff_tracks(ot, nt, tolerance_frames)
+            for c in d.changes:
+                if isinstance(c.details, dict):
+                    c.details.setdefault("track", ot.name)
+                    c.details.setdefault("track_kind", bucket)
+            combined.changes.extend(d.changes)
+            combined.warnings.extend(w for w in d.warnings if w not in combined.warnings)
+            for k in totals:
+                totals[k] += int(d.summary.get(k, 0) or 0)
+            old_dur_total += ot.duration_frames()
+            new_dur_total += nt.duration_frames()
+            combined.tracks_compared.append(ot.name)
+        for nt in new_tracks:
+            if not any(t.name == nt.name for t in old_tracks):
+                combined.warnings.append(f"Track added in new: {nt.name}")
+                offs = _track_offsets(nt)
+                for item in nt.items:
+                    pos = offs[item.index] if 0 <= item.index < len(offs) else None
+                    details = {"duration_s": round(_frames_to_seconds(item.duration_frames), 3),
+                               "track": nt.name, "track_kind": bucket}
+                    if pos is not None:
+                        details["timeline_start_s"] = pos
+                    combined.changes.append(
+                        ClipChange(type="added", index_old=None, index_new=item.index,
+                                   clip_name=item.name, url=item.url, kind=item.kind,
+                                   details=details)
+                    )
+                    totals["added"] += 1
+                old_d = 0.0
+                new_d = nt.duration_frames()
+                old_dur_total += old_d
+                new_dur_total += new_d
+                combined.tracks_compared.append(nt.name)
+
+    # Positions need per-track offsets — matched-track changes were already
+    # annotated inside diff_tracks; added/removed-track items were annotated
+    # at construction above.
+    delta = new_dur_total - old_dur_total
+    combined.summary = {
+        **totals,
+        "total_changes": len(combined.changes),
+        "old_duration_s": round(_frames_to_seconds(old_dur_total), 3),
+        "new_duration_s": round(_frames_to_seconds(new_dur_total), 3),
+        "runtime_delta_s": round(_frames_to_seconds(delta), 3),
+    }
+    return combined
+
+
+def _lookup_change_items(old, new, track_name, bucket, change):
+    """(old_item, new_item) for a change, resolved by index (best effort)."""
+    old_item = new_item = None
+    for tl, want_new in ((new, True), (old, False)):
+        try:
+            tracks = [t for t in tl.tracks if _track_bucket(t.kind) == bucket and t.name == track_name]
+            if not tracks:
+                # Fall back to any track with that name (bucket mismatch).
+                tracks = [t for t in tl.tracks if t.name == track_name]
+            if not tracks:
+                continue
+            track = tracks[0]
+            idx = change.index_new if want_new else change.index_old
+            if idx is None:
+                continue
+            if 0 <= idx < len(track.items):
+                if want_new:
+                    new_item = track.items[idx]
+                else:
+                    old_item = track.items[idx]
+        except Exception:
+            continue
+    return old_item, new_item
+
+
+# Empty space appearing, vanishing, or changing by this much is editorially
+# meaningful on its own; smaller gap wiggles are usually byproducts of
+# neighboring clip edits and stay out of the sections view.
+GAP_SIGNIFICANT_S = 5.0
+
+
+def _gap_magnitude(change, old_item=None, new_item=None) -> float | None:
+    """Size (seconds) behind a gap entry: duration for added/removed,
+    absolute change for trims."""
+    d = change.details if isinstance(getattr(change, "details", None), dict) else {}
+    for key in ("duration_s",):
+        try:
+            if d.get(key) is not None:
+                return abs(float(d[key]))
+        except (TypeError, ValueError):
+            pass
+    try:
+        if d.get("old_gap_s") is not None and d.get("new_gap_s") is not None:
+            return abs(float(d["new_gap_s"]) - float(d["old_gap_s"]))
+    except (TypeError, ValueError):
+        pass
+    try:
+        if d.get("delta_s") is not None:
+            return abs(float(d["delta_s"]))
+    except (TypeError, ValueError):
+        pass
+    try:
+        item = new_item if new_item is not None else old_item
+        if item is not None:
+            return abs(_frames_to_seconds(item.duration_frames))
+    except Exception:
+        pass
+    return None
+
+
+def _gap_significant(change, old_item=None, new_item=None) -> bool:
+    mag = _gap_magnitude(change, old_item, new_item)
+    return mag is not None and mag >= GAP_SIGNIFICANT_S
+
+
+def _entry_identity(change) -> str:
+    """Stable identity for grouping/disambiguation (mirrors loose identity)."""
+    url = getattr(change, "url", "") or ""
+    name = getattr(change, "clip_name", "") or ""
+    kind = getattr(change, "kind", "") or ""
+    if url:
+        return f"{kind}:clip:{url}"
+    return f"{kind}:name:{name}"
+
+
+def _source_range_s(item) -> tuple[float, float] | None:
+    """Source in/out (seconds) identifying WHICH segment of the media a clip
+    instance uses — from original timebase when available."""
+    if item is None:
+        return None
+    try:
+        rate = float(getattr(item, "orig_rate", 0) or 0)
+        if rate > 0 and getattr(item, "orig_start", None) is not None \
+                and getattr(item, "orig_duration", None) is not None:
+            s = float(item.orig_start) / rate
+            return (round(s, 3), round(s + float(item.orig_duration) / rate, 3))
+    except (TypeError, ValueError):
+        pass
+    try:
+        start = float(getattr(item, "start_frames", 0) or 0) / NORMALIZED_RATE
+        dur = float(getattr(item, "duration_frames", 0) or 0) / NORMALIZED_RATE
+        return (round(start, 3), round(start + dur, 3))
+    except (TypeError, ValueError):
+        return None
+
+
+def _source_line(item) -> str | None:
+    rng = _source_range_s(item)
+    if not rng:
+        return None
+    return f"Source: {format_timecode(rng[0])} – {format_timecode(rng[1])}"
+
+
+def build_sections(old, new, diff) -> list[dict]:
+    """Group a diff's changes into track sections for the What changed view.
+
+    Returns [{track, kind, entries}] with kind in video/audio/text. Video and
+    audio sections follow timeline track order and carry timeline timecodes;
+    title-clip changes across all tracks collect into a single TEXT section.
+    Tracks without changes are omitted. Gaps are infrastructure, not content:
+    only significant ones (empty space appearing/vanishing/changing by
+    GAP_SIGNIFICANT_S or more) survive — the rest still count in the gap note
+    via the flat changes list. Adjacent added/removed runs of the same clip
+    merge into one entry ("+ Added ×3"); repeated identities that stay
+    separate get a Source range line so instances are distinguishable.
+    Pure function of the diff.
+    """
+    buckets: dict[tuple[str, str], list] = {}
+    text_entries: list[dict] = []
+    changes = list(getattr(diff, "changes", []) or [])
+    default_track = (getattr(diff, "tracks_compared", None) or [None])[0]
+
+    # Working records: [entry, old_item, new_item, identity, mergeable]
+    records: list[list] = []
+    for c in changes:
+        d = c.details if isinstance(getattr(c, "details", None), dict) else {}
+        track = d.get("track") or default_track or "Video 1"
+        bucket = d.get("track_kind") or "video"
+        if bucket not in ("video", "audio"):
+            bucket = "video"
+        old_item, new_item = _lookup_change_items(old, new, track, bucket, c)
+        is_title = bool(d.get("is_title"))
+        if not is_title:
+            try:
+                is_title = bool((old_item is not None and old_item.is_title)
+                                or (new_item is not None and new_item.is_title))
+            except Exception:
+                is_title = False
+        pos = d.get("timeline_start_s", d.get("timeline_old_s"))
+        try:
+            pos_f = float(pos) if pos is not None else None
+        except (TypeError, ValueError):
+            pos_f = None
+        if c.kind == "gap":
+            if c.clip_name and not c.clip_name.startswith("Gap"):
+                label = f"Gap: {c.clip_name}"
+            else:
+                label = "Gap"
+        elif c.kind == "transition":
+            label = "Transition"
+        elif is_title:
+            label = None
+        else:
+            label = f"Clip: {c.clip_name or '(unnamed)'}"
+        entry = {
+            "timecode_s": pos_f,
+            "timecode": format_timecode(pos_f) if pos_f is not None else None,
+            "label": label,
+            "type": c.type,
+            "kind": c.kind,
+            "lines": change_lines(c, old_item, new_item),
+        }
+        if c.kind == "gap" and not _gap_significant(c, old_item, new_item):
+            continue
+        ident = _entry_identity(c)
+        mergeable = c.type in ("added", "removed") and not is_title
+        records.append([entry, old_item, new_item, ident, mergeable, is_title, bucket, track])
+
+    def _is_gap_rec(rec) -> bool:
+        return rec[0].get("kind") == "gap"
+
+    def _gap_dur(rec) -> float | None:
+        item = rec[2] if rec[2] is not None else rec[1]
+        try:
+            if item is not None:
+                return float(item.duration_frames)
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    # A gap that merely moved is spacing, not an edit: drop reordered gaps,
+    # and collapse removed+added gap pairs with equal duration (neighboring
+    # inserts rename all following gaps, so match by duration, not name).
+    kept: list[list] = []
+    removed_gaps: dict[tuple[str, str], list] = {}
+    for rec in records:
+        if _is_gap_rec(rec) and rec[0].get("type") == "reordered":
+            continue
+        if _is_gap_rec(rec) and rec[0].get("type") == "removed":
+            removed_gaps.setdefault((rec[6], rec[7]), []).append(rec)
+            continue
+        kept.append(rec)
+    records = []
+    for rec in kept:
+        if _is_gap_rec(rec) and rec[0].get("type") == "added":
+            d = _gap_dur(rec)
+            mates = removed_gaps.get((rec[6], rec[7]), [])
+            paired = None
+            if d is not None:
+                for m in mates:
+                    md = _gap_dur(m)
+                    if md is not None and abs(md - d) <= 1.0:
+                        paired = m
+                        break
+            if paired is not None:
+                mates.remove(paired)
+                continue
+        records.append(rec)
+    for mates in removed_gaps.values():
+        records.extend(mates)
+
+    # Merge adjacent added/removed runs of the same clip instance family
+    # ("Vid 5.mp4 ×3") instead of unexplained duplicate rows.
+    merged: list[list] = []
+    for rec in records:
+        entry = rec[0]
+        if (rec[4] and merged and merged[-1][4]
+                and merged[-1][0]["type"] == entry["type"]
+                and merged[-1][3] == rec[3]
+                and merged[-1][7] == rec[7] and merged[-1][6] == rec[6]):
+            prev = merged[-1][0]
+            prev["_count"] = prev.get("_count", 1) + 1
+            n = prev["_count"]
+            verb = "+ Added" if prev["type"] == "added" else "- Removed"
+            prev["lines"] = [f"{verb} ×{n}"]
+            continue
+        merged.append(rec)
+
+    # Disambiguate repeated instances that stay separate: a Source range line
+    # (timeline position alone can't tell two "Vid 5.mp4" rows apart). Clips
+    # only — gaps/transitions have no meaningful source range, and title text
+    # already identifies title entries.
+    counts: dict[str, int] = {}
+    for rec in merged:
+        counts[rec[3]] = counts.get(rec[3], 0) + 1
+    final: list[list] = []
+    for rec in merged:
+        entry = rec[0]
+        if (counts.get(rec[3], 0) > 1 and not rec[5] and "_count" not in entry
+                and entry.get("kind") == "clip"):
+            src = _source_line(rec[2] if rec[2] is not None else rec[1])
+            if src:
+                entry = dict(entry)
+                entry["lines"] = list(entry["lines"]) + [src]
+                rec = list(rec)
+                rec[0] = entry
+        final.append(rec)
+
+    for rec in final:
+        entry, _, _, _, _, is_title, bucket, track = rec
+        entry.pop("_count", None)
+        if is_title:
+            text_entries.append(entry)
+        else:
+            buckets.setdefault((bucket, track), []).append(entry)
+
+    sections: list[dict] = []
+
+    def _track_order(bucket: str) -> list[str]:
+        names: list[str] = []
+        for tl in (old, new):
+            try:
+                for t in tl.tracks:
+                    if _track_bucket(t.kind) == bucket and t.name not in names:
+                        names.append(t.name)
+            except Exception:
+                continue
+        for _, name in buckets:
+            if _ == bucket and name not in names:
+                names.append(name)
+        return names
+
+    for bucket in ("video", "audio"):
+        for name in _track_order(bucket):
+            entries = buckets.get((bucket, name), [])
+            if not entries:
+                continue
+            entries.sort(key=lambda e: (e["timecode_s"] is None, e["timecode_s"] or 0.0))
+            sections.append({"track": name, "kind": bucket, "entries": entries})
+    if text_entries:
+        text_entries.sort(key=lambda e: (e["timecode_s"] is None, e["timecode_s"] or 0.0))
+        sections.append({"track": "Text", "kind": "text", "entries": text_entries})
+    return sections
 
 
 def _plural_tracks(n: int, kind: str) -> str:
@@ -660,6 +1333,8 @@ def format_text(diff: TimelineDiff, old_name: str = "old", new_name: str = "new"
         parts.append(f"{s['trimmed']} trimmed")
     if s.get("reordered"):
         parts.append(f"{s['reordered']} reordered")
+    if s.get("modified"):
+        parts.append(f"{s['modified']} modified")
     if s.get("gap_changed"):
         parts.append(f"{s['gap_changed']} gaps changed")
     if s.get("transition_changed"):

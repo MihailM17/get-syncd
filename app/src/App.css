@@ -165,3 +165,28 @@ html,body,#root { height:100%; width:100%; margin:0; background:var(--bg); color
 @keyframes fadeIn { from{opacity:0} to{opacity:1} }
 @keyframes popIn { from{opacity:0; transform:scale(0.96)} to{opacity:1; transform:scale(1)} }
 @keyframes slideDown { from{opacity:0; transform:translateY(-10px)} to{opacity:1; transform:translateY(0)} }
+
+/* Timeline-changes sections (What changed view) */
+.tc-section { margin:18px 0 6px; text-align:left; }
+.tc-section:first-of-type { margin-top:6px; }
+.tc-head { display:flex; justify-content:space-between; align-items:baseline; background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:7px 12px; font-size:11px; font-weight:700; letter-spacing:.1em; color:var(--text); }
+.tc-count { color:var(--muted); font-weight:500; letter-spacing:0; font-size:11px; }
+.tc-entry { padding:10px 2px 11px; border-bottom:1px dashed var(--border); text-align:left; }
+.tc-entry:last-child { border-bottom:0; }
+.tc-entry-head { display:flex; gap:8px; align-items:baseline; font-size:13px; min-width:0; }
+.tc-time { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.tc-dash { color:var(--muted); flex-shrink:0; }
+.tc-clip { font-weight:600; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.tc-lines { margin:5px 0 1px 3px; padding-left:12px; border-left:2px solid var(--border); display:flex; flex-direction:column; gap:3px; }
+.tc-lines-bare { border-left:0; padding-left:0; margin-left:0; }
+.tc-line { display:flex; gap:8px; align-items:baseline; font-size:12.5px; color:var(--muted); line-height:1.45; }
+.tc-line span:last-child { overflow-wrap:anywhere; }
+.tc-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; align-self:center; background:var(--muted); }
+.tc-line.added .tc-dot { background:var(--green); }
+.tc-line.removed .tc-dot { background:var(--red); }
+.tc-line.trimmed .tc-dot { background:var(--yellow); }
+.tc-line.reordered .tc-dot { background:var(--orange); }
+.tc-line.modified .tc-dot { background:var(--orange-soft); box-shadow:inset 0 0 0 1.5px var(--orange); }
+.tc-line.renamed .tc-dot { background:var(--orange); }
+.tc-line.gap_changed .tc-dot { background:var(--muted); }
+.tc-line.transition_changed .tc-dot { background:var(--muted); }

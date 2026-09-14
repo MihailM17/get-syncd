@@ -1,6 +1,6 @@
 [project]
 name = "get-syncd"
-version = "0.3.0"
+version = "0.3.1"
 description = "Save points for DaVinci Resolve — version your timeline, see what changed, jump back to any cut"
 readme = "README.md"
 requires-python = ">=3.10"

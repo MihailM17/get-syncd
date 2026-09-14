@@ -31,7 +31,9 @@ type Status = { repo?: string; is_repo: boolean; has_changes: boolean | null; me
 type GraphCommit = { hash: string; short: string; message: string; relative?: string; date: string; lane?: number; isBranch?: boolean; isFork?: boolean; isCurrent?: boolean; branches?: string[] }
 type Graph = { ok?: boolean; current?: string; branches?: string[]; altBranch?: string | null; fork?: string | null; commits?: GraphCommit[] }
 type DiffChange = { type: string; index_old?: number | null; index_new?: number | null; clip_name?: string; kind?: string; details?: Record<string, number | string | boolean | undefined> }
-type Diff = { is_first_save?: boolean; summary?: { added?: number; removed?: number; trimmed?: number; reordered?: number; gap_changed?: number; total_changes?: number; runtime_delta_s?: number }; changes?: DiffChange[]; warnings?: string[]; new_track?: { items?: { name?: string }[] } | null }
+type TcEntry = { timecode_s: number | null; timecode: string | null; label: string | null; type: string; kind?: string; lines: string[] }
+type TcSection = { track: string; kind: string; entries: TcEntry[] }
+type Diff = { is_first_save?: boolean; summary?: { added?: number; removed?: number; trimmed?: number; reordered?: number; modified?: number; gap_changed?: number; total_changes?: number; runtime_delta_s?: number }; changes?: DiffChange[]; sections?: TcSection[]; warnings?: string[]; new_track?: { items?: { name?: string }[] } | null }
 
 export default function App() {
   const [defaultRepo, setDefaultRepo] = useState('')
@@ -99,6 +101,7 @@ export default function App() {
     if (s.removed) p.push(`${s.removed} ${s.removed===1?'clip removed':'clips removed'}`)
     if (s.trimmed) p.push(`${s.trimmed} ${s.trimmed===1?'clip trimmed':'clips trimmed'}`)
     if (s.reordered) p.push(`${s.reordered} moved`)
+    if (s.modified) p.push(`${s.modified} modified`)
     if (s.gap_changed) p.push(`${s.gap_changed} gap${s.gap_changed>1?'s':''} tweaked`)
     let t = p.join(' • ')
     const d = s.runtime_delta_s || 0
@@ -682,12 +685,75 @@ export default function App() {
               </div>
               <div className="changes">
                 <h3>{diff?.is_first_save ? "What's in this save" : 'What changed'}</h3>
-                {visChanges.length ? (showAllChanges ? visChanges : visChanges.slice(0,10)).map((c,i:number)=>(
-                  <div key={i} className={`change ${c.type}`}><span className="dot2" /> <span>{humanChange(c)}</span></div>
-                )) : <div className="muted">{diff?.is_first_save ? 'Empty save — no clips in this version' : 'No clip changes — maybe just a gap or timing tweak'}</div>}
-                {visChanges.length > 10 && (
-                  <button className="ghost" style={{marginTop:'8px'}} onClick={()=>setShowAllChanges(v=>!v)}>{showAllChanges ? 'Show less' : `Show all ${visChanges.length} changes`}</button>
-                )}
+                {(() => {
+                  // Timeline sections (backend-grouped, preformatted lines).
+                  // Gap curation happens server-side (only significant empty-
+                  // space changes survive); the client just renders + budgets.
+                  const secs = (diff?.sections || []).filter(s => s.entries.length)
+                  if (!secs.length) {
+                    // Fallback for old sidecars without sections.
+                    if (visChanges.length) {
+                      return (<>
+                        {(showAllChanges ? visChanges : visChanges.slice(0,10)).map((c,i:number)=>(
+                          <div key={i} className={`change ${c.type}`}><span className="dot2" /> <span>{humanChange(c)}</span></div>
+                        ))}
+                        {visChanges.length > 10 && (
+                          <button className="ghost" style={{marginTop:'8px'}} onClick={()=>setShowAllChanges(v=>!v)}>{showAllChanges ? 'Show less' : `Show all ${visChanges.length} changes`}</button>
+                        )}
+                      </>)
+                    }
+                    return <div className="muted">{diff?.is_first_save ? 'Empty save — no clips in this version' : 'No clip changes — maybe just a gap or timing tweak'}</div>
+                  }
+                  const flat: {si:number, e:TcEntry}[] = []
+                  secs.forEach((s, si) => s.entries.forEach(e => flat.push({si, e})))
+                  const shown = showAllChanges ? flat : flat.slice(0, 10)
+                  const shownBySection = new Map<number, TcEntry[]>()
+                  shown.forEach(({si, e}) => {
+                    if (!shownBySection.has(si)) shownBySection.set(si, [])
+                    shownBySection.get(si)!.push(e)
+                  })
+                  return (<>
+                    {secs.map((s, si) => {
+                      const list = shownBySection.get(si)
+                      if (!list) return null
+                      return (
+                        <div key={si} className="tc-section">
+                          <div className="tc-head">
+                            <span>{s.kind === 'text' ? 'TEXT' : s.track.toUpperCase()}</span>
+                            <span className="tc-count">{list.length}</span>
+                          </div>
+                          {list.map((e, ei) => (
+                            <div key={ei} className="tc-entry">
+                              {e.label ? (
+                                <>
+                                  <div className="tc-entry-head">
+                                    {e.timecode && <span className="tc-time">{e.timecode}</span>}
+                                    {e.timecode && <span className="tc-dash" aria-hidden="true">—</span>}
+                                    <span className="tc-clip">{e.label}</span>
+                                  </div>
+                                  <div className="tc-lines">
+                                    {e.lines.map((ln, li) => (
+                                      <div key={li} className={`tc-line ${e.type}`}><span className="tc-dot" /> <span>{ln}</span></div>
+                                    ))}
+                                  </div>
+                                </>
+                              ) : (
+                                <div className="tc-lines tc-lines-bare">
+                                  {e.lines.map((ln, li) => (
+                                    <div key={li} className={`tc-line ${e.type}`}><span className="tc-dot" /> <span>{ln}</span></div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )
+                    })}
+                    {flat.length > 10 && (
+                      <button className="ghost" style={{marginTop:'8px'}} onClick={()=>setShowAllChanges(v=>!v)}>{showAllChanges ? 'Show less' : `Show all ${flat.length} changes`}</button>
+                    )}
+                  </>)
+                })()}
                 {diff && (
                   <div className="notes">
                     {!diff.is_first_save && (diff.changes?.filter(c=> c.clip_name?.startsWith('Gap')).length || 0)>0 && (

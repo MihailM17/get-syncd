@@ -592,17 +592,45 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
     pb = None
     try:
         from .otio_parse import NormalizedTimeline
-        from .diff import format_text
+        from .diff import format_text, diff_all_tracks, build_sections, _track_offsets, _frames_to_seconds
+        from .diff import TimelineDiff as _TimelineDiff, ClipChange as _ClipChange
         if first_save:
             old = NormalizedTimeline(name="Empty", tracks=[])
             pb = _rev_to_file(b2)
             new = parse_otio_file(pb)
+            # First save: everything in every video/audio track is new.
+            d = _TimelineDiff(tracks_compared=[t.name for t in new.tracks])
+            _new_dur = 0.0
+            for _t in new.tracks:
+                _bucket = "audio" if "audio" in str(_t.kind or "").lower() else "video"
+                _offs = _track_offsets(_t)
+                _new_dur += _t.duration_frames()
+                for _item in _t.items:
+                    _pos = _offs[_item.index] if 0 <= _item.index < len(_offs) else None
+                    _det: dict = {"duration_s": round(_frames_to_seconds(_item.duration_frames), 3),
+                                   "track": _t.name, "track_kind": _bucket}
+                    if _pos is not None:
+                        _det["timeline_start_s"] = _pos
+                    d.changes.append(_ClipChange(type="added", index_old=None, index_new=_item.index,
+                                                clip_name=_item.name, url=_item.url, kind=_item.kind,
+                                                details=_det))
+            d.summary = {"added": len(d.changes), "removed": 0, "trimmed": 0, "reordered": 0,
+                         "modified": 0, "gap_changed": 0, "transition_changed": 0,
+                         "total_changes": len(d.changes),
+                         "old_duration_s": 0.0,
+                         "new_duration_s": round(_frames_to_seconds(_new_dur), 3),
+                         "runtime_delta_s": round(_frames_to_seconds(_new_dur), 3)}
         else:
             pa = _rev_to_file(a2)
             pb = _rev_to_file(b2)
             old = parse_otio_file(pa)
             new = parse_otio_file(pb)
-        d = diff_timelines(old, new)
+            d = diff_all_tracks(old, new)
+        try:
+            sections = build_sections(old, new, d)
+        except Exception as se:
+            log.warning("sections build failed for %s (timeline %s): %s", r, timeline, se)
+            sections = []
         # build viewer data for React bar (scoped to this timeline's file so
         # per-timeline bars work; guarded so a viewer failure never kills the diff)
         from .viewer.app import build_viewer_data
@@ -620,6 +648,7 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
             "is_first_save": first_save,
             "summary": d.summary,
             "changes": [c.to_dict() for c in d.changes],
+            "sections": sections,
             "warnings": d.warnings,
             "tracks_compared": d.tracks_compared,
             "changelog": changelog_line(d),
@@ -638,6 +667,7 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
             "is_first_save": first_save,
             "summary": {"added":0,"removed":0,"trimmed":0,"reordered":0,"total_changes":0,"old_duration_s":0,"new_duration_s":0,"runtime_delta_s":0},
             "changes": [],
+            "sections": [],
             "warnings": [f"Diff not available for timeline '{timeline}' — {e}"],
             "tracks_compared": [],
             "changelog": "No diff",

@@ -90,6 +90,18 @@ class NormalizedClip:
     # Clip extras
     enabled: bool = True
     metadata: dict = field(default_factory=dict)
+    # Fairlight clip volume in dB (None when the clip carries no volume
+    # effect). Resolve exports volume as Parameter ID "volume" whose default
+    # is 0.0 — i.e. the value is already dB, not linear gain.
+    volume_db: Optional[float] = None
+    # Title clips (GeneratorReference media): visible text when extractable,
+    # plus whether this clip is a title at all. Solid-color slugs share the
+    # GeneratorReference schema but are NOT titles (see _extract_title_text).
+    is_title: bool = False
+    title_text: Optional[str] = None
+    # For stacks: flattened descendant title texts (incl. nested compounds),
+    # so a title change deep inside a compound still surfaces in the diff.
+    title_texts: list = field(default_factory=list)
     # For stacks / nested sequences
     children: Optional[list] = None
 
@@ -159,6 +171,160 @@ def _rescale(value: float, from_rate: float, to_rate: float = NORMALIZED_RATE) -
     return float(value) * (to_rate / from_rate)
 
 
+def _as_map(o) -> dict:
+    """OTIO metadata comes back as AnyDictionary, not dict — duck-type it."""
+    if isinstance(o, dict):
+        return o
+    try:
+        if hasattr(o, "keys") and hasattr(o, "__getitem__"):
+            return dict(o)
+    except Exception:
+        pass
+    return {}
+
+
+def _as_list(v) -> list:
+    """OTIO sequences come back as AnyVector: iterable, but not a list."""
+    if isinstance(v, list):
+        return v
+    if isinstance(v, (str, bytes)):
+        return []
+    try:
+        if hasattr(v, "__iter__"):
+            return list(v)
+    except Exception:
+        pass
+    return []
+
+
+def _extract_volume_db(item) -> Optional[float]:
+    """Fairlight clip volume in dB, or None.
+
+    Resolve exports one "Resolve Effect" per clip with
+    metadata.Resolve_OTIO.Name == "Volume" and a "volume" parameter.
+    The parameter default is 0.0, so the value is already dB (a linear-gain
+    scale would default to 1.0).
+    """
+    try:
+        effects = getattr(item, "effects", None) or []
+    except Exception:
+        return None
+    for eff in effects:
+        try:
+            info = _as_map(getattr(eff, "metadata", None)).get("Resolve_OTIO", {})
+            info = _as_map(info)
+            if info.get("Name") != "Volume":
+                continue
+            for p in info.get("Parameters", []) or []:
+                p = _as_map(p)
+                if p.get("Parameter ID") == "volume":
+                    try:
+                        return float(p.get("Parameter Value"))
+                    except (TypeError, ValueError):
+                        return None
+        except Exception:
+            continue
+    return None
+
+
+def _strip_html(text: str) -> str:
+    import re as _re
+
+    s = text or ""
+    # Drop style/head/script blocks entirely (their *content* isn't visible
+    # text), then tags, then collapse whitespace.
+    s = _re.sub(r"<(style|head|script)[^>]*>.*?</\1>", " ", s, flags=_re.DOTALL | _re.IGNORECASE)
+    s = _re.sub(r"<[^>]+>", " ", s)
+    return _re.sub(r"\s+", " ", s).strip()
+
+
+def _extract_title_text(item) -> tuple[bool, Optional[str]]:
+    """(is_title, visible_text) for a track item.
+
+    Title clips reference a GeneratorReference. generator_kind "Rich" (and
+    friends) carrying "rich text" / Title HTML parameters are titles;
+    "Solid Color" slugs share the schema but are not. Priority: tags stripped
+    from "Title HTML" first — Resolve leaves the plain "rich text" value at
+    its factory default ("Title") while the HTML carries the authored text —
+    then "rich text", else None (caller shows the fallback).
+    """
+    try:
+        refs: list = []
+        mr = getattr(item, "media_reference", None)
+        if mr is not None:
+            refs.append(mr)
+        mrs = getattr(item, "media_references", None)
+        if isinstance(mrs, dict):
+            refs.extend(mrs.values())
+        for ref in refs:
+            try:
+                schema = ref.schema_name() if hasattr(ref, "schema_name") else ""
+            except Exception:
+                schema = ""
+            if "GeneratorReference" not in str(schema):
+                continue
+            kind = str(getattr(ref, "generator_kind", "") or "")
+            params = getattr(ref, "parameters", None) or {}
+            entries: list = []
+            pmap = _as_map(params)
+            if pmap:
+                for v in pmap.values():
+                    entries.extend(_as_list(v) or ([_as_map(v)] if _as_map(v) else []))
+            else:
+                entries = _as_list(params)
+            rich: Optional[str] = None
+            html: Optional[str] = None
+            is_title_kind = any(
+                k in kind.lower() for k in ("rich", "text", "title")
+            )
+            for entry in entries:
+                entry = _as_map(entry)
+                if not entry:
+                    continue
+                for p in entry.get("Parameters", []) or []:
+                    p = _as_map(p)
+                    if not p:
+                        continue
+                    pid = str(p.get("Parameter ID", ""))
+                    if pid == "rich text" and p.get("Parameter Value") not in (None, ""):
+                        rich = str(p.get("Parameter Value"))
+                    if pid == "title blob" or "Title HTML" in p:
+                        h = p.get("Title HTML", "")
+                        if h:
+                            html = _strip_html(str(h))
+            if html:
+                return True, html
+            if rich:
+                return True, rich.strip()
+            if is_title_kind:
+                return True, None
+        return False, None
+    except Exception:
+        return False, None
+
+
+def _descendant_titles(node) -> list[str]:
+    """Flattened title texts anywhere under a nested node.
+
+    Compounds deserialize as Stacks containing Tracks (a whole nested
+    timeline), so plain child recursion misses titles two levels down.
+    Used only for change detection/surfacing — the stack stays opaque.
+    """
+    out: list[str] = []
+    try:
+        otio = _otio()
+        if isinstance(node, (otio.schema.Track, otio.schema.Stack)):
+            for sub in node:
+                out.extend(_descendant_titles(sub))
+        elif isinstance(node, otio.schema.Clip):
+            _, text = _extract_title_text(node)
+            if text:
+                out.append(text)
+    except Exception:
+        pass
+    return out
+
+
 def _parse_item(item, index: int) -> NormalizedClip:
     otio = _otio()
     schema = item.schema_name() if hasattr(item, "schema_name") else type(item).__name__
@@ -206,6 +372,7 @@ def _parse_item(item, index: int) -> NormalizedClip:
             except Exception:
                 pass
 
+        _is_title, _title_text = _extract_title_text(item)
         return NormalizedClip(
             kind="clip",
             index=index,
@@ -218,6 +385,10 @@ def _parse_item(item, index: int) -> NormalizedClip:
             orig_rate=orig_rate,
             enabled=bool(getattr(item, "enabled", True)),
             metadata=dict(getattr(item, "metadata", {}) or {}),
+            volume_db=_extract_volume_db(item),
+            is_title=_is_title,
+            title_text=_title_text,
+            title_texts=[_title_text] if _title_text else [],
         )
 
     if isinstance(item, otio.schema.Gap):
@@ -273,6 +444,14 @@ def _parse_item(item, index: int) -> NormalizedClip:
         children = []
         for ci, child in enumerate(item):
             children.append(_parse_item(child, ci))
+        # Flattened descendant title texts so title changes deep inside a
+        # compound (Stacks nest Tracks, not just clips) still surface, with
+        # the stack's timeline position.
+        titles: list = []
+        for child in children:
+            titles.extend(getattr(child, "title_texts", []) or [])
+        if not titles:
+            titles = _descendant_titles(item)
         dur = 0.0
         try:
             d = item.duration()
@@ -286,6 +465,7 @@ def _parse_item(item, index: int) -> NormalizedClip:
             url="",
             duration_frames=dur,
             children=children,
+            title_texts=titles,
         )
 
     # Fallback for unknown types (e.g., GeneratorReference as clip-like)
