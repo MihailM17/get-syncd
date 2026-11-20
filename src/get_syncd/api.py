@@ -310,6 +310,7 @@ def api_status(repo: str | Path | None = None) -> dict:
                 "timelines": timelines,
                 "current_timeline": cur,
                 "all_timelines": all_names,
+                "remote_url": "",
             }
     # Get per-file status
     timelines_status = []
@@ -413,6 +414,16 @@ def api_status(repo: str | Path | None = None) -> dict:
         log.warning("stray legacy check failed for %s: %s", r, e)
     branches = []
     cur_branch = ""
+    remote_url = ""
+    try:
+        rm = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if rm.returncode == 0:
+            remote_url = rm.stdout.strip()
+    except Exception:
+        pass
     try:
         br = subprocess.run(["git", "branch", "--format=%(refname:short)"], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace")
         if br.returncode == 0:
@@ -438,6 +449,7 @@ def api_status(repo: str | Path | None = None) -> dict:
         "timelines": timelines_status,
         "current_timeline": cur,
         "all_timelines": all_names or combined_names,
+        "remote_url": remote_url,
     }
 
 def api_timelines(repo: str | Path | None = None) -> dict:
@@ -592,7 +604,7 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
     pb = None
     try:
         from .otio_parse import NormalizedTimeline
-        from .diff import format_text, diff_all_tracks, build_sections, _track_offsets, _frames_to_seconds
+        from .diff import format_text, diff_all_tracks, build_sections, build_visual_tracks, _track_offsets, _frames_to_seconds
         from .diff import TimelineDiff as _TimelineDiff, ClipChange as _ClipChange
         if first_save:
             old = NormalizedTimeline(name="Empty", tracks=[])
@@ -631,6 +643,11 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
         except Exception as se:
             log.warning("sections build failed for %s (timeline %s): %s", r, timeline, se)
             sections = []
+        try:
+            visual_tracks = build_visual_tracks(old, new, d)
+        except Exception as vte:
+            log.warning("visual_tracks build failed for %s (timeline %s): %s", r, timeline, vte)
+            visual_tracks = None
         # build viewer data for React bar (scoped to this timeline's file so
         # per-timeline bars work; guarded so a viewer failure never kills the diff)
         from .viewer.app import build_viewer_data
@@ -649,6 +666,7 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
             "summary": d.summary,
             "changes": [c.to_dict() for c in d.changes],
             "sections": sections,
+            "visual_tracks": visual_tracks,
             "warnings": d.warnings,
             "tracks_compared": d.tracks_compared,
             "changelog": changelog_line(d),
@@ -668,6 +686,7 @@ def api_diff(repo: str | Path | None = None, a: str = "HEAD~1", b: str = "HEAD",
             "summary": {"added":0,"removed":0,"trimmed":0,"reordered":0,"total_changes":0,"old_duration_s":0,"new_duration_s":0,"runtime_delta_s":0},
             "changes": [],
             "sections": [],
+            "visual_tracks": None,
             "warnings": [f"Diff not available for timeline '{timeline}' — {e}"],
             "tracks_compared": [],
             "changelog": "No diff",
@@ -1095,75 +1114,71 @@ def api_graph_viz(repo: str | Path | None = None, timeline: str | None = None) -
             })
         # Reverse to newest first for UI (like log)
         commits = list(reversed(commits))
-        # Find fork point: common ancestor of all branches (use main if exists)
-        fork = None
-        alt_branch = None
-        # Prefer non-main branch as alt (the experimental cut)
-        for b in branches:
-            if b not in ("main", "master"):
-                alt_branch = b
-                break
-        if not alt_branch and len(branches) > 1:
-            # No non-main alt, pick the one that is not current
-            for b in branches:
-                if b != current:
-                    alt_branch = b
-                    break
-        # Determine main branch name
-        main_branch = "main" if "main" in branches else "master" if "master" in branches else branches[0] if branches else current
-        if alt_branch:
+        main_branch = (
+            "main" if "main" in branches
+            else "master" if "master" in branches
+            else (branches[0] if branches else current)
+        )
+        alt_branches = [b for b in branches if b != main_branch]
+        alt_branch = alt_branches[0] if alt_branches else None
+
+        lane_for_commit: dict[str, tuple[int, str]] = {}
+        fork_hashes: dict[str, str] = {}
+        for lane_idx, b in enumerate(alt_branches, start=1):
             try:
-                # Fork is merge-base of main and alt (stable, not dependent on current)
-                mb = subprocess.run(["git", "merge-base", main_branch, alt_branch], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace")
+                mb = subprocess.run(
+                    ["git", "merge-base", main_branch, b],
+                    cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                )
                 if mb.returncode == 0 and mb.stdout.strip():
-                    fork = mb.stdout.strip()
+                    fork_hashes[b] = mb.stdout.strip()
+                excl = subprocess.run(
+                    ["git", "log", b, "--not", main_branch, "--pretty=format:%H"],
+                    cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                )
+                for h in excl.stdout.splitlines():
+                    h = h.strip()
+                    if h and h not in lane_for_commit:
+                        lane_for_commit[h] = (lane_idx, b)
             except Exception:
-                pass
-        # Mark each commit's visual role — whole tree always visible
+                continue
+
+        fork = fork_hashes.get(alt_branch) if alt_branch else None
+        fork_set = set(fork_hashes.values())
+
+        head = ""
+        try:
+            head_r = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            head = head_r.stdout.strip() if head_r.returncode == 0 else ""
+        except Exception:
+            pass
+
+        matched_head = False
         for c in commits:
-            c["lane"] = 0
-            c["isBranch"] = False
-            c["isFork"] = False
-            c["isCurrent"] = False
-        if alt_branch and fork:
-            for c in commits:
-                if c["hash"] == fork or c["hash"].startswith(fork[:8]) or fork.startswith(c["hash"][:8]):
-                    c["isFork"] = True
-                    c["lane"] = 0
-            # Alt branch's exclusive commits: alt_branch --not main (always, not dependent on current)
-            try:
-                alt_only = subprocess.run(["git", "log", alt_branch, "--not", main_branch, "--pretty=format:%H"], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace")
-                alt_hashes = set(h.strip() for h in alt_only.stdout.splitlines() if h.strip())
-                for c in commits:
-                    if c["hash"] in alt_hashes:
-                        c["isBranch"] = True
-                        c["lane"] = 1
-            except Exception:
-                pass
-            # Current position dot: HEAD of *current* branch (highlighted even if on main)
-            try:
-                head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip()
-                for c in commits:
-                    if c["hash"] == head:
-                        c["isCurrent"] = True
-                        break
-            except Exception:
-                pass
-            except Exception:
-                pass
-        else:
-            # No alternate branch — just mark current HEAD
-            try:
-                head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(r), capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip()
-                for c in commits:
-                    if c["hash"] == head:
-                        c["isCurrent"] = True
-                        break
-            except Exception:
-                pass
-            if commits:
-                commits[0]["isCurrent"] = True  # fallback
-        return {"ok": True, "repo": str(r), "current": current, "branches": branches, "altBranch": alt_branch, "fork": fork, "commits": commits}
+            lane, bname = lane_for_commit.get(c["hash"], (0, main_branch))
+            c["lane"] = lane
+            c["branchName"] = bname
+            c["isBranch"] = lane > 0
+            c["isFork"] = c["hash"] in fork_set
+            c["isCurrent"] = bool(head and c["hash"] == head)
+            if c["isCurrent"]:
+                matched_head = True
+        if not matched_head and commits:
+            commits[0]["isCurrent"] = True
+
+        return {
+            "ok": True,
+            "repo": str(r),
+            "current": current,
+            "branches": branches,
+            "altBranch": alt_branch,
+            "fork": fork,
+            "forks": fork_hashes,
+            "commits": commits,
+        }
     except Exception as e:
         return {"ok": False, "error": str(e), "commits": [], "branches": []}
 

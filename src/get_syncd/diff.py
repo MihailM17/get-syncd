@@ -961,7 +961,7 @@ def build_sections(old, new, diff) -> list[dict]:
 
     # Working records: [entry, old_item, new_item, identity, mergeable]
     records: list[list] = []
-    for c in changes:
+    for ci, c in enumerate(changes):
         d = c.details if isinstance(getattr(c, "details", None), dict) else {}
         track = d.get("track") or default_track or "Video 1"
         bucket = d.get("track_kind") or "video"
@@ -992,6 +992,8 @@ def build_sections(old, new, diff) -> list[dict]:
         else:
             label = f"Clip: {c.clip_name or '(unnamed)'}"
         entry = {
+            "change_id": ci,
+            "change_ids": [ci],
             "timecode_s": pos_f,
             "timecode": format_timecode(pos_f) if pos_f is not None else None,
             "label": label,
@@ -1059,6 +1061,7 @@ def build_sections(old, new, diff) -> list[dict]:
                 and merged[-1][7] == rec[7] and merged[-1][6] == rec[6]):
             prev = merged[-1][0]
             prev["_count"] = prev.get("_count", 1) + 1
+            prev["change_ids"] = list(prev.get("change_ids", [prev["change_id"]])) + list(entry.get("change_ids", []))
             n = prev["_count"]
             verb = "+ Added" if prev["type"] == "added" else "- Removed"
             prev["lines"] = [f"{verb} ×{n}"]
@@ -1120,6 +1123,134 @@ def build_sections(old, new, diff) -> list[dict]:
         text_entries.sort(key=lambda e: (e["timecode_s"] is None, e["timecode_s"] or 0.0))
         sections.append({"track": "Text", "kind": "text", "entries": text_entries})
     return sections
+
+
+def _short_track_label(name: str, bucket: str, fallback_idx: int) -> str:
+    prefix = "A" if bucket == "audio" else "V"
+    digits = "".join(ch for ch in (name or "") if ch.isdigit())
+    return f"{prefix}{digits or fallback_idx}"
+
+
+def build_visual_tracks(old: NormalizedTimeline, new: NormalizedTimeline, diff: TimelineDiff) -> dict:
+    """Serialize proportional before/after tracks + diff annotations for the NLE canvas."""
+    new_change_map: dict[tuple[str, str, int], tuple[int, ClipChange]] = {}
+    old_removed_by_track: dict[tuple[str, str], list[tuple[int, ClipChange]]] = {}
+    default_track = (getattr(diff, "tracks_compared", None) or [None])[0] or "Video 1"
+
+    for ci, c in enumerate(getattr(diff, "changes", []) or []):
+        d = c.details if isinstance(getattr(c, "details", None), dict) else {}
+        track = d.get("track") or default_track
+        bucket = d.get("track_kind") or "video"
+        if bucket not in ("video", "audio"):
+            bucket = "video"
+        if c.index_new is not None:
+            new_change_map[(bucket, track, c.index_new)] = (ci, c)
+        if c.type == "removed" and c.index_old is not None:
+            old_removed_by_track.setdefault((bucket, track), []).append((ci, c))
+
+    def _serialize_track(track: NormalizedTrack, bucket: str, side: str) -> list[dict]:
+        offs = _track_offsets(track)
+        items: list[dict] = []
+        for idx, item in enumerate(track.items):
+            if item.kind == "gap":
+                continue
+            start_s = offs[idx] if idx < len(offs) else 0.0
+            dur_s = round(_frames_to_seconds(item.duration_frames), 3)
+            rec = {
+                "id": f"{side}-{bucket}-{track.name}-{idx}",
+                "name": item.name or "(unnamed)",
+                "kind": item.kind,
+                "start_s": start_s,
+                "duration_s": dur_s,
+                "status": "unchanged",
+                "change_id": None,
+                "delta_s": 0.0,
+                "head_delta_s": 0.0,
+                "tail_delta_s": 0.0,
+                "detail": None,
+                "source": _source_line(item),
+            }
+            if side == "after":
+                hit = new_change_map.get((bucket, track.name, idx))
+                if hit:
+                    ci, ch = hit
+                    d = ch.details if isinstance(ch.details, dict) else {}
+                    try:
+                        delta_s = float(d.get("delta_s", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        delta_s = 0.0
+                    try:
+                        head_s = float(d.get("start_delta_frames", 0.0) or 0.0) / NORMALIZED_RATE
+                    except (TypeError, ValueError):
+                        head_s = 0.0
+                    old_item, new_item = _lookup_change_items(old, new, track.name, bucket, ch)
+                    lines = change_lines(ch, old_item, new_item)
+                    rec["status"] = ch.type
+                    rec["change_id"] = ci
+                    rec["delta_s"] = round(delta_s, 3)
+                    rec["head_delta_s"] = round(head_s, 3)
+                    rec["tail_delta_s"] = round(delta_s + head_s, 3)
+                    rec["detail"] = " • ".join(lines) if lines else None
+            items.append(rec)
+        return items
+
+    tracks_out: list[dict] = []
+    max_dur = 0.0
+
+    # Video tracks top-down (V2 above V1), audio tracks top-down (A1 above A2)
+    for bucket, reverse_order in (("video", True), ("audio", False)):
+        old_map = {t.name: t for t in old.tracks if _track_bucket(t.kind) == bucket}
+        new_map = {t.name: t for t in new.tracks if _track_bucket(t.kind) == bucket}
+        names = list(dict.fromkeys([*old_map.keys(), *new_map.keys()]))
+        if reverse_order:
+            names.reverse()
+
+        for order_idx, name in enumerate(names, start=1):
+            ot = old_map.get(name)
+            nt = new_map.get(name)
+            before_items = _serialize_track(ot, bucket, "before") if ot else []
+            after_items = _serialize_track(nt, bucket, "after") if nt else []
+
+            removed_ghosts: list[dict] = []
+            if ot:
+                old_offs = _track_offsets(ot)
+                for ci, ch in old_removed_by_track.get((bucket, name), []):
+                    idx = ch.index_old
+                    if idx is not None and 0 <= idx < len(ot.items) and ot.items[idx].kind != "gap":
+                        it = ot.items[idx]
+                        removed_ghosts.append({
+                            "id": f"ghost-{bucket}-{name}-{idx}",
+                            "name": it.name or "(unnamed)",
+                            "kind": it.kind,
+                            "start_s": old_offs[idx],
+                            "duration_s": round(_frames_to_seconds(it.duration_frames), 3),
+                            "status": "removed",
+                            "change_id": ci,
+                            "delta_s": 0.0,
+                            "head_delta_s": 0.0,
+                            "tail_delta_s": 0.0,
+                            "detail": "- Removed",
+                            "source": _source_line(it),
+                        })
+
+            for lst in (before_items, after_items, removed_ghosts):
+                for it in lst:
+                    max_dur = max(max_dur, it["start_s"] + it["duration_s"])
+
+            if before_items or after_items or removed_ghosts:
+                tracks_out.append({
+                    "name": name,
+                    "short": _short_track_label(name, bucket, order_idx),
+                    "kind": bucket,
+                    "before": before_items,
+                    "after": after_items,
+                    "removed": removed_ghosts,
+                })
+
+    return {
+        "duration_s": round(max(max_dur, 1.0), 3),
+        "tracks": tracks_out,
+    }
 
 
 def _plural_tracks(n: int, kind: str) -> str:
